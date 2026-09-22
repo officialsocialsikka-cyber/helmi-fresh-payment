@@ -109,7 +109,7 @@ export default async function handler(req, res) {
             description: "HELMI FRESH Helmet Sanitization",
             reference_id: referenceId,
             reminder_enable: false,
-            expire_by: Math.floor(Date.now() / 1000) + 900,
+            expire_by: Math.floor(Date.now() / 1000) + 1800,
           }),
         }
       );
