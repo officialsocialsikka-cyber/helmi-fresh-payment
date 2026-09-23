@@ -7,6 +7,7 @@ export const config = {
 };
 
 const AMOUNT = 500; // ₹5
+const PAYMENT_TIMEOUT_SECONDS = 120;
 
 function sendJson(res, status, data) {
   res.status(status);
@@ -38,6 +39,7 @@ async function readRawBody(req) {
 
 export default async function handler(req, res) {
   try {
+
     // HEALTH CHECK
     if (req.method === "GET" && !req.query?.action) {
       return sendJson(res, 200, {
@@ -48,6 +50,7 @@ export default async function handler(req, res) {
 
     // CHECK PAYMENT STATUS
     if (req.method === "GET" && req.query?.action === "status") {
+
       const paymentLinkId = req.query.payment_link_id;
 
       if (!paymentLinkId) {
@@ -87,11 +90,60 @@ export default async function handler(req, res) {
       });
     }
 
+    // CANCEL PAYMENT LINK
+    if (
+      req.method === "POST" &&
+      req.headers["x-helmi-action"] === "cancel-payment"
+    ) {
+
+      const paymentLinkId = req.query.payment_link_id;
+
+      if (!paymentLinkId) {
+        return sendJson(res, 400, {
+          success: false,
+          error: "payment_link_id is required",
+        });
+      }
+
+      const response = await fetch(
+        `https://api.razorpay.com/v1/payment_links/${encodeURIComponent(
+          paymentLinkId
+        )}/cancel`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: razorpayAuth(),
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({}),
+        }
+      );
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        return sendJson(res, response.status, {
+          success: false,
+          error:
+            data.error?.description ||
+            "Payment link cancellation failed",
+        });
+      }
+
+      return sendJson(res, 200, {
+        success: true,
+        payment_link_id: data.id,
+        status: data.status,
+        cancelled_at: data.cancelled_at,
+      });
+    }
+
     // CREATE ₹5 PAYMENT LINK
     if (
       req.method === "POST" &&
       req.headers["x-helmi-action"] === "create-payment"
     ) {
+
       const referenceId = `HELMI-${Date.now()}`;
 
       const response = await fetch(
@@ -109,7 +161,11 @@ export default async function handler(req, res) {
             description: "HELMI FRESH Helmet Sanitization",
             reference_id: referenceId,
             reminder_enable: false,
-            expire_by: Math.floor(Date.now() / 1000) + 1800,
+
+            // 120 seconds expiry
+            expire_by:
+              Math.floor(Date.now() / 1000) +
+              PAYMENT_TIMEOUT_SECONDS,
           }),
         }
       );
@@ -119,7 +175,9 @@ export default async function handler(req, res) {
       if (!response.ok) {
         return sendJson(res, response.status, {
           success: false,
-          error: data.error?.description || "Payment Link creation failed",
+          error:
+            data.error?.description ||
+            "Payment Link creation failed",
         });
       }
 
@@ -130,15 +188,20 @@ export default async function handler(req, res) {
         short_url: data.short_url,
         status: data.status,
         reference_id: data.reference_id,
+        expires_in_seconds: PAYMENT_TIMEOUT_SECONDS,
       });
     }
 
     // RAZORPAY WEBHOOK
     if (req.method === "POST") {
+
       const rawBody = await readRawBody(req);
 
-      const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
-      const signature = req.headers["x-razorpay-signature"];
+      const webhookSecret =
+        process.env.RAZORPAY_WEBHOOK_SECRET;
+
+      const signature =
+        req.headers["x-razorpay-signature"];
 
       if (!webhookSecret || !signature) {
         return sendJson(res, 401, {
@@ -165,9 +228,14 @@ export default async function handler(req, res) {
         });
       }
 
-      const event = JSON.parse(rawBody.toString("utf8"));
+      const event = JSON.parse(
+        rawBody.toString("utf8")
+      );
 
-      console.log("Verified Razorpay webhook:", event.event);
+      console.log(
+        "Verified Razorpay webhook:",
+        event.event
+      );
 
       return sendJson(res, 200, {
         received: true,
@@ -179,8 +247,13 @@ export default async function handler(req, res) {
       success: false,
       error: "Method not allowed",
     });
+
   } catch (error) {
-    console.error("HELMI FRESH Payment Error:", error);
+
+    console.error(
+      "HELMI FRESH Payment Error:",
+      error
+    );
 
     return sendJson(res, 500, {
       success: false,
