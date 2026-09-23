@@ -13,7 +13,8 @@ export const config = {
 const PAYMENT_AMOUNT = 500; // ₹5
 const PAYMENT_TIMER_SECONDS = 120;
 
-// QR server validity longer than ESP32 timer
+// Razorpay requires QR close_by to be sufficiently
+// ahead of current time. 960 sec = 16 minutes.
 const QR_CLOSE_BY_SECONDS = 960;
 
 // ==================================================
@@ -144,6 +145,17 @@ async function razorpayRequest(
 }
 
 // ==================================================
+// SMALL DELAY
+// ==================================================
+
+function sleep(ms) {
+  return new Promise(
+    resolve =>
+      setTimeout(resolve, ms)
+  );
+}
+
+// ==================================================
 // MAIN HANDLER
 // ==================================================
 
@@ -197,12 +209,29 @@ export default async function handler(
         QR_CLOSE_BY_SECONDS;
 
       console.log(
-        "Creating Razorpay UPI QR:",
+        "================================"
+      );
+
+      console.log(
+        "HELMI FRESH: CREATE QR"
+      );
+
+      console.log(
+        "Reference:",
         referenceId
       );
 
+      console.log(
+        "Amount:",
+        PAYMENT_AMOUNT
+      );
+
+      console.log(
+        "================================"
+      );
+
       // ------------------------------------------------
-      // CREATE RAZORPAY QR
+      // CREATE RAZORPAY UPI QR
       // ------------------------------------------------
 
       const createResult =
@@ -242,12 +271,12 @@ export default async function handler(
         );
 
       console.log(
-        "Razorpay CREATE status:",
+        "Razorpay CREATE HTTP:",
         createResult.response.status
       );
 
       console.log(
-        "Razorpay CREATE response:",
+        "Razorpay CREATE RESPONSE:",
         createResult.data
       );
 
@@ -281,12 +310,17 @@ export default async function handler(
       const qrId =
         qr?.id;
 
+      // ------------------------------------------------
+      // QR ID CHECK
+      // ------------------------------------------------
+
       if (!qrId) {
 
         console.error(
-          "QR ID missing:",
-          qr
+          "QR ID missing:"
         );
+
+        console.error(qr);
 
         return sendJson(
           res,
@@ -304,58 +338,92 @@ export default async function handler(
         );
       }
 
+      console.log(
+        "QR CREATED:",
+        qrId
+      );
+
       // ==================================================
-      // GET IMAGE_CONTENT FROM CREATE RESPONSE
+      // GET IMAGE_CONTENT
       // ==================================================
 
       let upiUrl =
         qr?.image_content || "";
 
       // ==================================================
-      // FALLBACK:
-      // FETCH QR AGAIN
+      // RETRY FETCH QR
       // ==================================================
 
       if (
-        !upiUrl ||
-        !upiUrl.startsWith("upi://pay")
+        !upiUrl.startsWith(
+          "upi://pay"
+        )
       ) {
 
         console.log(
-          "image_content missing from create response."
+          "image_content not available in CREATE response."
         );
 
         console.log(
-          "Fetching QR again using QR ID:",
-          qrId
+          "Starting QR FETCH retries..."
         );
 
-        const fetchResult =
-          await razorpayRequest(
-            `/v1/payments/qr_codes/${encodeURIComponent(
-              qrId
-            )}`,
-            "GET"
-          );
-
-        console.log(
-          "Razorpay FETCH QR status:",
-          fetchResult.response.status
-        );
-
-        console.log(
-          "Razorpay FETCH QR response:",
-          fetchResult.data
-        );
-
-        if (
-          fetchResult.response.ok
+        for (
+          let attempt = 1;
+          attempt <= 5;
+          attempt++
         ) {
 
-          upiUrl =
+          console.log(
+            `QR FETCH attempt ${attempt}/5`
+          );
+
+          // Small delay before fetch
+          await sleep(1500);
+
+          const fetchResult =
+            await razorpayRequest(
+              `/v1/payments/qr_codes/${encodeURIComponent(
+                qrId
+              )}`,
+              "GET"
+            );
+
+          console.log(
+            "QR FETCH HTTP:",
+            fetchResult.response.status
+          );
+
+          console.log(
+            "QR FETCH RESPONSE:",
             fetchResult.data
-              ?.image_content ||
-            "";
+          );
+
+          if (
+            fetchResult.response.ok &&
+            fetchResult.data?.image_content &&
+            fetchResult.data.image_content.startsWith(
+              "upi://pay"
+            )
+          ) {
+
+            upiUrl =
+              fetchResult.data.image_content;
+
+            console.log(
+              "================================"
+            );
+
+            console.log(
+              "DIRECT UPI PAYLOAD FOUND"
+            );
+
+            console.log(
+              "================================"
+            );
+
+            break;
+          }
         }
       }
 
@@ -365,11 +433,17 @@ export default async function handler(
 
       if (
         !upiUrl ||
-        !upiUrl.startsWith("upi://pay")
+        !upiUrl.startsWith(
+          "upi://pay"
+        )
       ) {
 
         console.error(
-          "Valid UPI payload not found."
+          "================================"
+        );
+
+        console.error(
+          "DIRECT UPI PAYLOAD NOT FOUND"
         );
 
         console.error(
@@ -378,8 +452,12 @@ export default async function handler(
         );
 
         console.error(
-          "image_url:",
-          qr?.image_url
+          "IMAGE URL:",
+          qr?.image_url || null
+        );
+
+        console.error(
+          "================================"
         );
 
         return sendJson(
@@ -390,7 +468,7 @@ export default async function handler(
               false,
 
             error:
-              "Razorpay QR was created but a direct UPI payload was not available",
+              "QR was created but direct UPI payload was not available",
 
             qr_id:
               qrId,
@@ -406,7 +484,7 @@ export default async function handler(
       // ==================================================
 
       console.log(
-        "Direct UPI payload ready."
+        "Sending Direct UPI QR data to ESP32..."
       );
 
       return sendJson(
@@ -469,6 +547,11 @@ export default async function handler(
         );
       }
 
+      console.log(
+        "Checking QR payment:",
+        qrId
+      );
+
       const result =
         await razorpayRequest(
           `/v1/payments/qr_codes/${encodeURIComponent(
@@ -478,8 +561,12 @@ export default async function handler(
         );
 
       console.log(
-        "QR PAYMENT STATUS:",
-        qrId,
+        "QR PAYMENT STATUS HTTP:",
+        result.response.status
+      );
+
+      console.log(
+        "QR PAYMENT STATUS RESPONSE:",
         result.data
       );
 
@@ -516,7 +603,7 @@ export default async function handler(
 
       const paidPayment =
         items.find(
-          (payment) =>
+          payment =>
             payment.status ===
               "captured" &&
             Number(
@@ -528,8 +615,20 @@ export default async function handler(
       if (paidPayment) {
 
         console.log(
-          "PAYMENT CAPTURED:",
+          "================================"
+        );
+
+        console.log(
+          "PAYMENT CAPTURED"
+        );
+
+        console.log(
+          "Payment ID:",
           paidPayment.id
+        );
+
+        console.log(
+          "================================"
         );
 
         return sendJson(
@@ -612,7 +711,7 @@ export default async function handler(
       }
 
       console.log(
-        "Closing QR:",
+        "Closing Razorpay QR:",
         qrId
       );
 
@@ -626,12 +725,12 @@ export default async function handler(
         );
 
       console.log(
-        "QR CLOSE status:",
+        "QR CLOSE HTTP:",
         result.response.status
       );
 
       console.log(
-        "QR CLOSE response:",
+        "QR CLOSE RESPONSE:",
         result.data
       );
 
@@ -819,8 +918,19 @@ export default async function handler(
   } catch (error) {
 
     console.error(
-      "HELMI FRESH Payment Error:",
+      "================================"
+    );
+
+    console.error(
+      "HELMI FRESH PAYMENT ERROR"
+    );
+
+    console.error(
       error
+    );
+
+    console.error(
+      "================================"
     );
 
     return sendJson(
