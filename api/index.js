@@ -6,7 +6,7 @@ export const config = {
   },
 };
 
-const AMOUNT = 5000; // ₹50
+const AMOUNT = 500; // ₹5
 
 function sendJson(res, status, data) {
   res.status(status);
@@ -87,7 +87,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // CREATE ₹50 PAYMENT LINK
+    // CREATE ₹5 PAYMENT LINK
     if (
       req.method === "POST" &&
       req.headers["x-helmi-action"] === "create-payment"
@@ -125,7 +125,7 @@ export default async function handler(req, res) {
 
       return sendJson(res, 200, {
         success: true,
-        amount: 50,
+        amount: 5,
         payment_link_id: data.id,
         short_url: data.short_url,
         status: data.status,
