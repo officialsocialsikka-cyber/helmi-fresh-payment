@@ -6,25 +6,57 @@ export const config = {
   },
 };
 
-const AMOUNT = 500; // ₹5
+// ==================================================
+// HELMI FRESH PAYMENT SETTINGS
+// ==================================================
 
-// ESP32 screen payment timer
+// ₹5 = 500 paise
+const AMOUNT = 500;
+
+// ESP32 screen timer
+// Customer has 120 seconds to complete payment
 const PAYMENT_TIMEOUT_SECONDS = 120;
 
-// Razorpay Payment Link must remain valid for at least 15 minutes.
-// 960 seconds = 16 minutes, giving a little safety margin.
+// Razorpay Payment Link minimum validity is 15 minutes.
+// We keep it valid for 16 minutes so ESP32 can cancel it
+// after its own 120-second timer.
 const RAZORPAY_LINK_EXPIRY_SECONDS = 960;
+
+
+// ==================================================
+// SEND JSON
+// ==================================================
 
 function sendJson(res, status, data) {
   res.status(status);
-  res.setHeader("Content-Type", "application/json");
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  return res.end(JSON.stringify(data));
+
+  res.setHeader(
+    "Content-Type",
+    "application/json"
+  );
+
+  res.setHeader(
+    "Access-Control-Allow-Origin",
+    "*"
+  );
+
+  return res.end(
+    JSON.stringify(data)
+  );
 }
 
+
+// ==================================================
+// RAZORPAY AUTH
+// ==================================================
+
 function razorpayAuth() {
-  const keyId = process.env.RAZORPAY_KEY_ID;
-  const keySecret = process.env.RAZORPAY_KEY_SECRET;
+
+  const keyId =
+    process.env.RAZORPAY_KEY_ID;
+
+  const keySecret =
+    process.env.RAZORPAY_KEY_SECRET;
 
   if (!keyId || !keySecret) {
     throw new Error(
@@ -34,14 +66,23 @@ function razorpayAuth() {
 
   return (
     "Basic " +
-    Buffer.from(`${keyId}:${keySecret}`).toString("base64")
+    Buffer.from(
+      `${keyId}:${keySecret}`
+    ).toString("base64")
   );
 }
 
+
+// ==================================================
+// READ RAW WEBHOOK BODY
+// ==================================================
+
 async function readRawBody(req) {
+
   const chunks = [];
 
   for await (const chunk of req) {
+
     chunks.push(
       Buffer.isBuffer(chunk)
         ? chunk
@@ -52,8 +93,15 @@ async function readRawBody(req) {
   return Buffer.concat(chunks);
 }
 
+
+// ==================================================
+// MAIN HANDLER
+// ==================================================
+
 export default async function handler(req, res) {
+
   try {
+
     // ==================================================
     // HEALTH CHECK
     // ==================================================
@@ -62,11 +110,18 @@ export default async function handler(req, res) {
       req.method === "GET" &&
       !req.query?.action
     ) {
-      return sendJson(res, 200, {
-        status: "online",
-        service: "HELMI FRESH Payment Server",
-      });
+
+      return sendJson(
+        res,
+        200,
+        {
+          status: "online",
+          service:
+            "HELMI FRESH Payment Server",
+        }
+      );
     }
+
 
     // ==================================================
     // CHECK PAYMENT STATUS
@@ -76,47 +131,80 @@ export default async function handler(req, res) {
       req.method === "GET" &&
       req.query?.action === "status"
     ) {
+
       const paymentLinkId =
         req.query.payment_link_id;
 
       if (!paymentLinkId) {
-        return sendJson(res, 400, {
-          success: false,
-          error: "payment_link_id is required",
-        });
+
+        return sendJson(
+          res,
+          400,
+          {
+            success: false,
+            error:
+              "payment_link_id is required",
+          }
+        );
       }
 
-      const response = await fetch(
-        `https://api.razorpay.com/v1/payment_links/${encodeURIComponent(
-          paymentLinkId
-        )}`,
-        {
-          method: "GET",
-          headers: {
-            Authorization: razorpayAuth(),
-          },
-        }
-      );
 
-      const data = await response.json();
+      const response =
+        await fetch(
+          `https://api.razorpay.com/v1/payment_links/${encodeURIComponent(
+            paymentLinkId
+          )}`,
+          {
+            method: "GET",
+
+            headers: {
+              Authorization:
+                razorpayAuth(),
+            },
+          }
+        );
+
+
+      const data =
+        await response.json();
+
 
       if (!response.ok) {
-        return sendJson(res, response.status, {
-          success: false,
-          error:
-            data.error?.description ||
-            "Unable to check payment status",
-        });
+
+        return sendJson(
+          res,
+          response.status,
+          {
+            success: false,
+            error:
+              data.error?.description ||
+              "Unable to check payment status",
+          }
+        );
       }
 
-      return sendJson(res, 200, {
-        success: true,
-        payment_link_id: data.id,
-        status: data.status,
-        amount: data.amount,
-        amount_paid: data.amount_paid,
-      });
+
+      return sendJson(
+        res,
+        200,
+        {
+          success: true,
+
+          payment_link_id:
+            data.id,
+
+          status:
+            data.status,
+
+          amount:
+            data.amount,
+
+          amount_paid:
+            data.amount_paid,
+        }
+      );
     }
+
 
     // ==================================================
     // CANCEL PAYMENT LINK
@@ -124,51 +212,88 @@ export default async function handler(req, res) {
 
     if (
       req.method === "POST" &&
-      req.headers["x-helmi-action"] ===
-        "cancel-payment"
+      req.headers[
+        "x-helmi-action"
+      ] === "cancel-payment"
     ) {
+
       const paymentLinkId =
         req.query.payment_link_id;
 
+
       if (!paymentLinkId) {
-        return sendJson(res, 400, {
-          success: false,
-          error: "payment_link_id is required",
-        });
+
+        return sendJson(
+          res,
+          400,
+          {
+            success: false,
+            error:
+              "payment_link_id is required",
+          }
+        );
       }
 
-      const response = await fetch(
-        `https://api.razorpay.com/v1/payment_links/${encodeURIComponent(
-          paymentLinkId
-        )}/cancel`,
-        {
-          method: "POST",
-          headers: {
-            Authorization: razorpayAuth(),
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({}),
-        }
-      );
 
-      const data = await response.json();
+      const response =
+        await fetch(
+          `https://api.razorpay.com/v1/payment_links/${encodeURIComponent(
+            paymentLinkId
+          )}/cancel`,
+          {
+            method: "POST",
+
+            headers: {
+              Authorization:
+                razorpayAuth(),
+
+              "Content-Type":
+                "application/json",
+            },
+
+            body:
+              JSON.stringify({}),
+          }
+        );
+
+
+      const data =
+        await response.json();
+
 
       if (!response.ok) {
-        return sendJson(res, response.status, {
-          success: false,
-          error:
-            data.error?.description ||
-            "Payment link cancellation failed",
-        });
+
+        return sendJson(
+          res,
+          response.status,
+          {
+            success: false,
+            error:
+              data.error?.description ||
+              "Payment link cancellation failed",
+          }
+        );
       }
 
-      return sendJson(res, 200, {
-        success: true,
-        payment_link_id: data.id,
-        status: data.status,
-        cancelled_at: data.cancelled_at,
-      });
+
+      return sendJson(
+        res,
+        200,
+        {
+          success: true,
+
+          payment_link_id:
+            data.id,
+
+          status:
+            data.status,
+
+          cancelled_at:
+            data.cancelled_at,
+        }
+      );
     }
+
 
     // ==================================================
     // CREATE ₹5 PAYMENT LINK
@@ -176,102 +301,154 @@ export default async function handler(req, res) {
 
     if (
       req.method === "POST" &&
-      req.headers["x-helmi-action"] ===
-        "create-payment"
+      req.headers[
+        "x-helmi-action"
+      ] === "create-payment"
     ) {
+
       const referenceId =
         `HELMI-${Date.now()}`;
 
-      const response = await fetch(
-        "https://api.razorpay.com/v1/payment_links",
-        {
-          method: "POST",
-          headers: {
-            Authorization: razorpayAuth(),
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            amount: AMOUNT,
-            currency: "INR",
-            accept_partial: false,
 
-            description:
-              "HELMI FRESH Helmet Sanitization",
+      const response =
+        await fetch(
+          "https://api.razorpay.com/v1/payment_links",
+          {
+            method: "POST",
 
-            reference_id: referenceId,
+            headers: {
+              Authorization:
+                razorpayAuth(),
 
-            reminder_enable: false,
+              "Content-Type":
+                "application/json",
+            },
 
-            // Razorpay link validity:
-            // 16 minutes
-            expire_by:
-              Math.floor(Date.now() / 1000) +
-              RAZORPAY_LINK_EXPIRY_SECONDS,
-          }),
-        }
-      );
+            body:
+              JSON.stringify({
 
-      const data = await response.json();
+                // ₹5
+                amount:
+                  AMOUNT,
+
+                currency:
+                  "INR",
+
+                accept_partial:
+                  false,
+
+                description:
+                  "HELMI FRESH Helmet Sanitization",
+
+                reference_id:
+                  referenceId,
+
+                reminder_enable:
+                  false,
+
+                // Razorpay Link:
+                // 16 minutes validity
+                expire_by:
+                  Math.floor(
+                    Date.now() / 1000
+                  ) +
+                  RAZORPAY_LINK_EXPIRY_SECONDS,
+              }),
+          }
+        );
+
+
+      const data =
+        await response.json();
+
 
       if (!response.ok) {
-        return sendJson(res, response.status, {
-          success: false,
-          error:
-            data.error?.description ||
-            "Payment Link creation failed",
-        });
+
+        return sendJson(
+          res,
+          response.status,
+          {
+            success: false,
+            error:
+              data.error?.description ||
+              "Payment Link creation failed",
+          }
+        );
       }
 
-      return sendJson(res, 200, {
-        success: true,
 
-        // ₹5
-        amount: 5,
+      return sendJson(
+        res,
+        200,
+        {
+          success: true,
 
-        payment_link_id: data.id,
+          // ₹5
+          amount: 5,
 
-        short_url: data.short_url,
+          // Razorpay Payment Link ID
+          payment_link_id:
+            data.id,
 
-        status: data.status,
+          // QR will use this URL
+          short_url:
+            data.short_url,
 
-        reference_id: data.reference_id,
+          // created
+          status:
+            data.status,
 
-        // ESP32 payment timer
-        payment_timer_seconds:
-          PAYMENT_TIMEOUT_SECONDS,
+          reference_id:
+            data.reference_id,
 
-        // Actual Razorpay link expiry
-        razorpay_link_expiry_seconds:
-          RAZORPAY_LINK_EXPIRY_SECONDS,
-      });
+          // ESP32 timer
+          payment_timer_seconds:
+            PAYMENT_TIMEOUT_SECONDS,
+
+          // Actual Razorpay link validity
+          razorpay_link_expiry_seconds:
+            RAZORPAY_LINK_EXPIRY_SECONDS,
+        }
+      );
     }
+
 
     // ==================================================
     // RAZORPAY WEBHOOK
     // ==================================================
 
     if (req.method === "POST") {
+
       const rawBody =
         await readRawBody(req);
 
+
       const webhookSecret =
         process.env.RAZORPAY_WEBHOOK_SECRET;
+
 
       const signature =
         req.headers[
           "x-razorpay-signature"
         ];
 
+
       if (
         !webhookSecret ||
         !signature
       ) {
-        return sendJson(res, 401, {
-          success: false,
-          error:
-            "Webhook authentication failed",
-        });
+
+        return sendJson(
+          res,
+          401,
+          {
+            success: false,
+            error:
+              "Webhook authentication failed",
+          }
+        );
       }
+
 
       const expectedSignature =
         crypto
@@ -282,63 +459,92 @@ export default async function handler(req, res) {
           .update(rawBody)
           .digest("hex");
 
+
       const received =
         Buffer.from(signature);
+
 
       const expected =
         Buffer.from(
           expectedSignature
         );
 
+
       if (
         received.length !==
           expected.length ||
+
         !crypto.timingSafeEqual(
           received,
           expected
         )
       ) {
-        return sendJson(res, 401, {
-          success: false,
-          error:
-            "Invalid webhook signature",
-        });
+
+        return sendJson(
+          res,
+          401,
+          {
+            success: false,
+            error:
+              "Invalid webhook signature",
+          }
+        );
       }
+
 
       const event =
         JSON.parse(
           rawBody.toString("utf8")
         );
 
+
       console.log(
         "Verified Razorpay webhook:",
         event.event
       );
 
-      return sendJson(res, 200, {
-        received: true,
-        verified: true,
-      });
+
+      return sendJson(
+        res,
+        200,
+        {
+          received: true,
+          verified: true,
+        }
+      );
     }
+
 
     // ==================================================
     // METHOD NOT ALLOWED
     // ==================================================
 
-    return sendJson(res, 405, {
-      success: false,
-      error: "Method not allowed",
-    });
+    return sendJson(
+      res,
+      405,
+      {
+        success: false,
+        error:
+          "Method not allowed",
+      }
+    );
 
   } catch (error) {
+
     console.error(
       "HELMI FRESH Payment Error:",
       error
     );
 
-    return sendJson(res, 500, {
-      success: false,
-      error: "Internal server error",
-    });
+
+    return sendJson(
+      res,
+      500,
+      {
+        success: false,
+        error:
+          "Internal server error",
+      }
+    );
   }
 }
