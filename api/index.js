@@ -10,16 +10,11 @@ export const config = {
 // HELMI FRESH SETTINGS
 // ==================================================
 
-// ₹5 = 500 paise
-const PAYMENT_AMOUNT = 500;
-
-// ESP32 timer = 120 seconds
+const PAYMENT_AMOUNT = 500; // ₹5
 const PAYMENT_TIMER_SECONDS = 120;
 
-// Razorpay QR must stay valid beyond the ESP32 timer.
-// 960 seconds = 16 minutes.
+// QR server validity longer than ESP32 timer
 const QR_CLOSE_BY_SECONDS = 960;
-
 
 // ==================================================
 // SEND JSON
@@ -42,7 +37,6 @@ function sendJson(res, status, data) {
     JSON.stringify(data)
   );
 }
-
 
 // ==================================================
 // RAZORPAY AUTH
@@ -70,7 +64,6 @@ function razorpayAuth() {
   );
 }
 
-
 // ==================================================
 // READ RAW BODY
 // ==================================================
@@ -91,9 +84,8 @@ async function readRawBody(req) {
   return Buffer.concat(chunks);
 }
 
-
 // ==================================================
-// RAZORPAY REQUEST
+// RAZORPAY API REQUEST
 // ==================================================
 
 async function razorpayRequest(
@@ -115,6 +107,7 @@ async function razorpayRequest(
   };
 
   if (body !== null) {
+
     options.body =
       JSON.stringify(body);
   }
@@ -125,15 +118,30 @@ async function razorpayRequest(
       options
     );
 
-  const data =
-    await response.json();
+  const text =
+    await response.text();
+
+  let data = {};
+
+  try {
+
+    data =
+      text
+        ? JSON.parse(text)
+        : {};
+
+  } catch {
+
+    data = {
+      raw: text,
+    };
+  }
 
   return {
     response,
     data,
   };
 }
-
 
 // ==================================================
 // MAIN HANDLER
@@ -159,14 +167,14 @@ export default async function handler(
         res,
         200,
         {
-          status: "online",
+          status:
+            "online",
 
           service:
             "HELMI FRESH UPI QR Payment Server",
         }
       );
     }
-
 
     // ==================================================
     // CREATE DIRECT UPI QR
@@ -182,19 +190,22 @@ export default async function handler(
       const referenceId =
         `HELMI-${Date.now()}`;
 
-
       const closeBy =
         Math.floor(
           Date.now() / 1000
         ) +
         QR_CLOSE_BY_SECONDS;
 
+      console.log(
+        "Creating Razorpay UPI QR:",
+        referenceId
+      );
 
       // ------------------------------------------------
-      // CREATE RAZORPAY UPI QR
+      // CREATE RAZORPAY QR
       // ------------------------------------------------
 
-      const result =
+      const createResult =
         await razorpayRequest(
           "/v1/payments/qr_codes",
           "POST",
@@ -230,52 +241,50 @@ export default async function handler(
           }
         );
 
+      console.log(
+        "Razorpay CREATE status:",
+        createResult.response.status
+      );
+
+      console.log(
+        "Razorpay CREATE response:",
+        createResult.data
+      );
 
       // ------------------------------------------------
-      // RAZORPAY ERROR
+      // RAZORPAY CREATE ERROR
       // ------------------------------------------------
 
       if (
-        !result.response.ok
+        !createResult.response.ok
       ) {
 
         return sendJson(
           res,
-          result.response.status,
+          createResult.response.status,
           {
-            success: false,
+            success:
+              false,
 
             error:
-              result.data?.error
+              createResult.data?.error
                 ?.description ||
+              createResult.data?.raw ||
               "Razorpay QR creation failed",
           }
         );
       }
 
-
       const qr =
-        result.data;
+        createResult.data;
 
+      const qrId =
+        qr?.id;
 
-      // ------------------------------------------------
-      // IMPORTANT:
-      // image_content IS ALREADY IN CREATE RESPONSE
-      // ------------------------------------------------
-
-      const upiUrl =
-        qr.image_content;
-
-
-      if (
-        !upiUrl ||
-        !upiUrl.startsWith(
-          "upi://pay"
-        )
-      ) {
+      if (!qrId) {
 
         console.error(
-          "Razorpay QR response:",
+          "QR ID missing:",
           qr
         );
 
@@ -283,48 +292,155 @@ export default async function handler(
           res,
           500,
           {
-            success: false,
+            success:
+              false,
 
             error:
-              "Razorpay did not return a valid UPI QR payload",
+              "Razorpay QR ID missing",
+
+            razorpay_response:
+              qr,
           }
         );
       }
 
+      // ==================================================
+      // GET IMAGE_CONTENT FROM CREATE RESPONSE
+      // ==================================================
 
-      // ------------------------------------------------
+      let upiUrl =
+        qr?.image_content || "";
+
+      // ==================================================
+      // FALLBACK:
+      // FETCH QR AGAIN
+      // ==================================================
+
+      if (
+        !upiUrl ||
+        !upiUrl.startsWith("upi://pay")
+      ) {
+
+        console.log(
+          "image_content missing from create response."
+        );
+
+        console.log(
+          "Fetching QR again using QR ID:",
+          qrId
+        );
+
+        const fetchResult =
+          await razorpayRequest(
+            `/v1/payments/qr_codes/${encodeURIComponent(
+              qrId
+            )}`,
+            "GET"
+          );
+
+        console.log(
+          "Razorpay FETCH QR status:",
+          fetchResult.response.status
+        );
+
+        console.log(
+          "Razorpay FETCH QR response:",
+          fetchResult.data
+        );
+
+        if (
+          fetchResult.response.ok
+        ) {
+
+          upiUrl =
+            fetchResult.data
+              ?.image_content ||
+            "";
+        }
+      }
+
+      // ==================================================
+      // FINAL UPI PAYLOAD CHECK
+      // ==================================================
+
+      if (
+        !upiUrl ||
+        !upiUrl.startsWith("upi://pay")
+      ) {
+
+        console.error(
+          "Valid UPI payload not found."
+        );
+
+        console.error(
+          "QR ID:",
+          qrId
+        );
+
+        console.error(
+          "image_url:",
+          qr?.image_url
+        );
+
+        return sendJson(
+          res,
+          500,
+          {
+            success:
+              false,
+
+            error:
+              "Razorpay QR was created but a direct UPI payload was not available",
+
+            qr_id:
+              qrId,
+
+            image_url:
+              qr?.image_url || null,
+          }
+        );
+      }
+
+      // ==================================================
       // RETURN DATA TO ESP32
-      // ------------------------------------------------
+      // ==================================================
+
+      console.log(
+        "Direct UPI payload ready."
+      );
 
       return sendJson(
         res,
         200,
         {
-          success: true,
+          success:
+            true,
 
-          amount: 5,
+          amount:
+            PAYMENT_AMOUNT / 100,
 
           qr_id:
-            qr.id,
+            qrId,
 
           upi_url:
             upiUrl,
 
           status:
-            qr.status,
+            qr.status ||
+            "active",
 
           payment_timer_seconds:
             PAYMENT_TIMER_SECONDS,
 
           razorpay_qr_close_by:
-            qr.close_by,
+            qr.close_by ||
+            closeBy,
 
           reference_id:
             referenceId,
         }
       );
     }
-
 
     // ==================================================
     // CHECK QR PAYMENT STATUS
@@ -338,21 +454,20 @@ export default async function handler(
       const qrId =
         req.query.qr_id;
 
-
       if (!qrId) {
 
         return sendJson(
           res,
           400,
           {
-            success: false,
+            success:
+              false,
 
             error:
               "qr_id is required",
           }
         );
       }
-
 
       const result =
         await razorpayRequest(
@@ -362,6 +477,11 @@ export default async function handler(
           "GET"
         );
 
+      console.log(
+        "QR PAYMENT STATUS:",
+        qrId,
+        result.data
+      );
 
       if (
         !result.response.ok
@@ -371,16 +491,17 @@ export default async function handler(
           res,
           result.response.status,
           {
-            success: false,
+            success:
+              false,
 
             error:
               result.data?.error
                 ?.description ||
+              result.data?.raw ||
               "Unable to check QR payment status",
           }
         );
       }
-
 
       const items =
         Array.isArray(
@@ -389,8 +510,10 @@ export default async function handler(
           ? result.data.items
           : [];
 
+      // ==================================================
+      // FIND CAPTURED ₹5 PAYMENT
+      // ==================================================
 
-      // Find captured ₹5 payment
       const paidPayment =
         items.find(
           (payment) =>
@@ -402,16 +525,22 @@ export default async function handler(
               PAYMENT_AMOUNT
         );
 
-
       if (paidPayment) {
+
+        console.log(
+          "PAYMENT CAPTURED:",
+          paidPayment.id
+        );
 
         return sendJson(
           res,
           200,
           {
-            success: true,
+            success:
+              true,
 
-            paid: true,
+            paid:
+              true,
 
             qr_id:
               qrId,
@@ -434,14 +563,15 @@ export default async function handler(
         );
       }
 
-
       return sendJson(
         res,
         200,
         {
-          success: true,
+          success:
+            true,
 
-          paid: false,
+          paid:
+            false,
 
           qr_id:
             qrId,
@@ -451,7 +581,6 @@ export default async function handler(
         }
       );
     }
-
 
     // ==================================================
     // CLOSE QR
@@ -467,14 +596,14 @@ export default async function handler(
       const qrId =
         req.query.qr_id;
 
-
       if (!qrId) {
 
         return sendJson(
           res,
           400,
           {
-            success: false,
+            success:
+              false,
 
             error:
               "qr_id is required",
@@ -482,6 +611,10 @@ export default async function handler(
         );
       }
 
+      console.log(
+        "Closing QR:",
+        qrId
+      );
 
       const result =
         await razorpayRequest(
@@ -492,6 +625,15 @@ export default async function handler(
           {}
         );
 
+      console.log(
+        "QR CLOSE status:",
+        result.response.status
+      );
+
+      console.log(
+        "QR CLOSE response:",
+        result.data
+      );
 
       if (
         !result.response.ok
@@ -501,22 +643,24 @@ export default async function handler(
           res,
           result.response.status,
           {
-            success: false,
+            success:
+              false,
 
             error:
               result.data?.error
                 ?.description ||
+              result.data?.raw ||
               "QR close failed",
           }
         );
       }
 
-
       return sendJson(
         res,
         200,
         {
-          success: true,
+          success:
+            true,
 
           qr_id:
             result.data.id,
@@ -533,7 +677,6 @@ export default async function handler(
       );
     }
 
-
     // ==================================================
     // RAZORPAY WEBHOOK
     // ==================================================
@@ -545,17 +688,14 @@ export default async function handler(
       const rawBody =
         await readRawBody(req);
 
-
       const webhookSecret =
         process.env
           .RAZORPAY_WEBHOOK_SECRET;
-
 
       const signature =
         req.headers[
           "x-razorpay-signature"
         ];
-
 
       if (
         !webhookSecret ||
@@ -566,14 +706,14 @@ export default async function handler(
           res,
           401,
           {
-            success: false,
+            success:
+              false,
 
             error:
               "Webhook authentication failed",
           }
         );
       }
-
 
       const expectedSignature =
         crypto
@@ -584,18 +724,15 @@ export default async function handler(
           .update(rawBody)
           .digest("hex");
 
-
       const received =
         Buffer.from(
           signature
         );
 
-
       const expected =
         Buffer.from(
           expectedSignature
         );
-
 
       if (
         received.length !==
@@ -610,7 +747,8 @@ export default async function handler(
           res,
           401,
           {
-            success: false,
+            success:
+              false,
 
             error:
               "Invalid webhook signature",
@@ -618,32 +756,49 @@ export default async function handler(
         );
       }
 
+      let event = {};
 
-      const event =
-        JSON.parse(
-          rawBody.toString(
-            "utf8"
-          )
+      try {
+
+        event =
+          JSON.parse(
+            rawBody.toString(
+              "utf8"
+            )
+          );
+
+      } catch {
+
+        return sendJson(
+          res,
+          400,
+          {
+            success:
+              false,
+
+            error:
+              "Invalid webhook JSON",
+          }
         );
-
+      }
 
       console.log(
         "Verified Razorpay webhook:",
         event.event
       );
 
-
       return sendJson(
         res,
         200,
         {
-          received: true,
+          received:
+            true,
 
-          verified: true,
+          verified:
+            true,
         }
       );
     }
-
 
     // ==================================================
     // METHOD NOT ALLOWED
@@ -653,7 +808,8 @@ export default async function handler(
       res,
       405,
       {
-        success: false,
+        success:
+          false,
 
         error:
           "Method not allowed",
@@ -667,14 +823,15 @@ export default async function handler(
       error
     );
 
-
     return sendJson(
       res,
       500,
       {
-        success: false,
+        success:
+          false,
 
         error:
+          error?.message ||
           "Internal server error",
       }
     );
