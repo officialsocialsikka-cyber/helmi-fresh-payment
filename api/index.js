@@ -7,7 +7,13 @@ export const config = {
 };
 
 const AMOUNT = 500; // ₹5
+
+// ESP32 screen payment timer
 const PAYMENT_TIMEOUT_SECONDS = 120;
+
+// Razorpay Payment Link must remain valid for at least 15 minutes.
+// 960 seconds = 16 minutes, giving a little safety margin.
+const RAZORPAY_LINK_EXPIRY_SECONDS = 960;
 
 function sendJson(res, status, data) {
   res.status(status);
@@ -21,17 +27,26 @@ function razorpayAuth() {
   const keySecret = process.env.RAZORPAY_KEY_SECRET;
 
   if (!keyId || !keySecret) {
-    throw new Error("Razorpay API credentials are not configured");
+    throw new Error(
+      "Razorpay API credentials are not configured"
+    );
   }
 
-  return "Basic " + Buffer.from(`${keyId}:${keySecret}`).toString("base64");
+  return (
+    "Basic " +
+    Buffer.from(`${keyId}:${keySecret}`).toString("base64")
+  );
 }
 
 async function readRawBody(req) {
   const chunks = [];
 
   for await (const chunk of req) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    chunks.push(
+      Buffer.isBuffer(chunk)
+        ? chunk
+        : Buffer.from(chunk)
+    );
   }
 
   return Buffer.concat(chunks);
@@ -39,19 +54,30 @@ async function readRawBody(req) {
 
 export default async function handler(req, res) {
   try {
-
+    // ==================================================
     // HEALTH CHECK
-    if (req.method === "GET" && !req.query?.action) {
+    // ==================================================
+
+    if (
+      req.method === "GET" &&
+      !req.query?.action
+    ) {
       return sendJson(res, 200, {
         status: "online",
         service: "HELMI FRESH Payment Server",
       });
     }
 
+    // ==================================================
     // CHECK PAYMENT STATUS
-    if (req.method === "GET" && req.query?.action === "status") {
+    // ==================================================
 
-      const paymentLinkId = req.query.payment_link_id;
+    if (
+      req.method === "GET" &&
+      req.query?.action === "status"
+    ) {
+      const paymentLinkId =
+        req.query.payment_link_id;
 
       if (!paymentLinkId) {
         return sendJson(res, 400, {
@@ -77,7 +103,9 @@ export default async function handler(req, res) {
       if (!response.ok) {
         return sendJson(res, response.status, {
           success: false,
-          error: data.error?.description || "Unable to check payment status",
+          error:
+            data.error?.description ||
+            "Unable to check payment status",
         });
       }
 
@@ -90,13 +118,17 @@ export default async function handler(req, res) {
       });
     }
 
+    // ==================================================
     // CANCEL PAYMENT LINK
+    // ==================================================
+
     if (
       req.method === "POST" &&
-      req.headers["x-helmi-action"] === "cancel-payment"
+      req.headers["x-helmi-action"] ===
+        "cancel-payment"
     ) {
-
-      const paymentLinkId = req.query.payment_link_id;
+      const paymentLinkId =
+        req.query.payment_link_id;
 
       if (!paymentLinkId) {
         return sendJson(res, 400, {
@@ -138,13 +170,17 @@ export default async function handler(req, res) {
       });
     }
 
+    // ==================================================
     // CREATE ₹5 PAYMENT LINK
+    // ==================================================
+
     if (
       req.method === "POST" &&
-      req.headers["x-helmi-action"] === "create-payment"
+      req.headers["x-helmi-action"] ===
+        "create-payment"
     ) {
-
-      const referenceId = `HELMI-${Date.now()}`;
+      const referenceId =
+        `HELMI-${Date.now()}`;
 
       const response = await fetch(
         "https://api.razorpay.com/v1/payment_links",
@@ -158,14 +194,19 @@ export default async function handler(req, res) {
             amount: AMOUNT,
             currency: "INR",
             accept_partial: false,
-            description: "HELMI FRESH Helmet Sanitization",
+
+            description:
+              "HELMI FRESH Helmet Sanitization",
+
             reference_id: referenceId,
+
             reminder_enable: false,
 
-            // 120 seconds expiry
+            // Razorpay link validity:
+            // 16 minutes
             expire_by:
               Math.floor(Date.now() / 1000) +
-              PAYMENT_TIMEOUT_SECONDS,
+              RAZORPAY_LINK_EXPIRY_SECONDS,
           }),
         }
       );
@@ -183,54 +224,91 @@ export default async function handler(req, res) {
 
       return sendJson(res, 200, {
         success: true,
+
+        // ₹5
         amount: 5,
+
         payment_link_id: data.id,
+
         short_url: data.short_url,
+
         status: data.status,
+
         reference_id: data.reference_id,
-        expires_in_seconds: PAYMENT_TIMEOUT_SECONDS,
+
+        // ESP32 payment timer
+        payment_timer_seconds:
+          PAYMENT_TIMEOUT_SECONDS,
+
+        // Actual Razorpay link expiry
+        razorpay_link_expiry_seconds:
+          RAZORPAY_LINK_EXPIRY_SECONDS,
       });
     }
 
+    // ==================================================
     // RAZORPAY WEBHOOK
-    if (req.method === "POST") {
+    // ==================================================
 
-      const rawBody = await readRawBody(req);
+    if (req.method === "POST") {
+      const rawBody =
+        await readRawBody(req);
 
       const webhookSecret =
         process.env.RAZORPAY_WEBHOOK_SECRET;
 
       const signature =
-        req.headers["x-razorpay-signature"];
-
-      if (!webhookSecret || !signature) {
-        return sendJson(res, 401, {
-          success: false,
-          error: "Webhook authentication failed",
-        });
-      }
-
-      const expectedSignature = crypto
-        .createHmac("sha256", webhookSecret)
-        .update(rawBody)
-        .digest("hex");
-
-      const received = Buffer.from(signature);
-      const expected = Buffer.from(expectedSignature);
+        req.headers[
+          "x-razorpay-signature"
+        ];
 
       if (
-        received.length !== expected.length ||
-        !crypto.timingSafeEqual(received, expected)
+        !webhookSecret ||
+        !signature
       ) {
         return sendJson(res, 401, {
           success: false,
-          error: "Invalid webhook signature",
+          error:
+            "Webhook authentication failed",
         });
       }
 
-      const event = JSON.parse(
-        rawBody.toString("utf8")
-      );
+      const expectedSignature =
+        crypto
+          .createHmac(
+            "sha256",
+            webhookSecret
+          )
+          .update(rawBody)
+          .digest("hex");
+
+      const received =
+        Buffer.from(signature);
+
+      const expected =
+        Buffer.from(
+          expectedSignature
+        );
+
+      if (
+        received.length !==
+          expected.length ||
+        !crypto.timingSafeEqual(
+          received,
+          expected
+        )
+      ) {
+        return sendJson(res, 401, {
+          success: false,
+          error:
+            "Invalid webhook signature",
+        });
+      }
+
+      const event =
+        JSON.parse(
+          rawBody.toString("utf8")
+        );
 
       console.log(
         "Verified Razorpay webhook:",
@@ -243,13 +321,16 @@ export default async function handler(req, res) {
       });
     }
 
+    // ==================================================
+    // METHOD NOT ALLOWED
+    // ==================================================
+
     return sendJson(res, 405, {
       success: false,
       error: "Method not allowed",
     });
 
   } catch (error) {
-
     console.error(
       "HELMI FRESH Payment Error:",
       error
