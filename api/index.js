@@ -7,20 +7,18 @@ export const config = {
 };
 
 // ==================================================
-// HELMI FRESH PAYMENT SETTINGS
+// HELMI FRESH SETTINGS
 // ==================================================
 
 // ₹5 = 500 paise
-const AMOUNT = 500;
+const PAYMENT_AMOUNT = 500;
 
-// ESP32 screen timer
-// Customer has 120 seconds to complete payment
-const PAYMENT_TIMEOUT_SECONDS = 120;
+// ESP32 customer timer
+const PAYMENT_TIMER_SECONDS = 120;
 
-// Razorpay Payment Link minimum validity is 15 minutes.
-// We keep it valid for 16 minutes so ESP32 can cancel it
-// after its own 120-second timer.
-const RAZORPAY_LINK_EXPIRY_SECONDS = 960;
+// Razorpay QR must live longer than the ESP32 timer.
+// 960 seconds = 16 minutes.
+const QR_CLOSE_BY_SECONDS = 960;
 
 
 // ==================================================
@@ -51,7 +49,6 @@ function sendJson(res, status, data) {
 // ==================================================
 
 function razorpayAuth() {
-
   const keyId =
     process.env.RAZORPAY_KEY_ID;
 
@@ -74,7 +71,7 @@ function razorpayAuth() {
 
 
 // ==================================================
-// READ RAW WEBHOOK BODY
+// READ RAW BODY
 // ==================================================
 
 async function readRawBody(req) {
@@ -95,16 +92,53 @@ async function readRawBody(req) {
 
 
 // ==================================================
-// MAIN HANDLER
+// RAZORPAY API HELPER
+// ==================================================
+
+async function razorpayRequest(
+  path,
+  method = "GET",
+  body = null
+) {
+
+  const options = {
+    method,
+    headers: {
+      Authorization:
+        razorpayAuth(),
+      "Content-Type":
+        "application/json",
+    },
+  };
+
+  if (body !== null) {
+    options.body =
+      JSON.stringify(body);
+  }
+
+  const response =
+    await fetch(
+      `https://api.razorpay.com${path}`,
+      options
+    );
+
+  const data =
+    await response.json();
+
+  return {
+    response,
+    data,
+  };
+}
+
+
+// ==================================================
+// HEALTH CHECK
 // ==================================================
 
 export default async function handler(req, res) {
 
   try {
-
-    // ==================================================
-    // HEALTH CHECK
-    // ==================================================
 
     if (
       req.method === "GET" &&
@@ -117,186 +151,14 @@ export default async function handler(req, res) {
         {
           status: "online",
           service:
-            "HELMI FRESH Payment Server",
+            "HELMI FRESH UPI QR Payment Server",
         }
       );
     }
 
 
     // ==================================================
-    // CHECK PAYMENT STATUS
-    // ==================================================
-
-    if (
-      req.method === "GET" &&
-      req.query?.action === "status"
-    ) {
-
-      const paymentLinkId =
-        req.query.payment_link_id;
-
-      if (!paymentLinkId) {
-
-        return sendJson(
-          res,
-          400,
-          {
-            success: false,
-            error:
-              "payment_link_id is required",
-          }
-        );
-      }
-
-
-      const response =
-        await fetch(
-          `https://api.razorpay.com/v1/payment_links/${encodeURIComponent(
-            paymentLinkId
-          )}`,
-          {
-            method: "GET",
-
-            headers: {
-              Authorization:
-                razorpayAuth(),
-            },
-          }
-        );
-
-
-      const data =
-        await response.json();
-
-
-      if (!response.ok) {
-
-        return sendJson(
-          res,
-          response.status,
-          {
-            success: false,
-            error:
-              data.error?.description ||
-              "Unable to check payment status",
-          }
-        );
-      }
-
-
-      return sendJson(
-        res,
-        200,
-        {
-          success: true,
-
-          payment_link_id:
-            data.id,
-
-          status:
-            data.status,
-
-          amount:
-            data.amount,
-
-          amount_paid:
-            data.amount_paid,
-        }
-      );
-    }
-
-
-    // ==================================================
-    // CANCEL PAYMENT LINK
-    // ==================================================
-
-    if (
-      req.method === "POST" &&
-      req.headers[
-        "x-helmi-action"
-      ] === "cancel-payment"
-    ) {
-
-      const paymentLinkId =
-        req.query.payment_link_id;
-
-
-      if (!paymentLinkId) {
-
-        return sendJson(
-          res,
-          400,
-          {
-            success: false,
-            error:
-              "payment_link_id is required",
-          }
-        );
-      }
-
-
-      const response =
-        await fetch(
-          `https://api.razorpay.com/v1/payment_links/${encodeURIComponent(
-            paymentLinkId
-          )}/cancel`,
-          {
-            method: "POST",
-
-            headers: {
-              Authorization:
-                razorpayAuth(),
-
-              "Content-Type":
-                "application/json",
-            },
-
-            body:
-              JSON.stringify({}),
-          }
-        );
-
-
-      const data =
-        await response.json();
-
-
-      if (!response.ok) {
-
-        return sendJson(
-          res,
-          response.status,
-          {
-            success: false,
-            error:
-              data.error?.description ||
-              "Payment link cancellation failed",
-          }
-        );
-      }
-
-
-      return sendJson(
-        res,
-        200,
-        {
-          success: true,
-
-          payment_link_id:
-            data.id,
-
-          status:
-            data.status,
-
-          cancelled_at:
-            data.cancelled_at,
-        }
-      );
-    }
-
-
-    // ==================================================
-    // CREATE ₹5 PAYMENT LINK
+    // CREATE DIRECT UPI QR
     // ==================================================
 
     if (
@@ -309,69 +171,138 @@ export default async function handler(req, res) {
       const referenceId =
         `HELMI-${Date.now()}`;
 
+      const closeBy =
+        Math.floor(
+          Date.now() / 1000
+        ) +
+        QR_CLOSE_BY_SECONDS;
 
-      const response =
-        await fetch(
-          "https://api.razorpay.com/v1/payment_links",
+
+      // ----------------------------------------------
+      // CREATE QR
+      // ----------------------------------------------
+
+      const createResult =
+        await razorpayRequest(
+          "/v1/payments/qr_codes",
+          "POST",
           {
-            method: "POST",
+            type: "upi_qr",
 
-            headers: {
-              Authorization:
-                razorpayAuth(),
+            name:
+              "HELMI FRESH",
 
-              "Content-Type":
-                "application/json",
+            usage:
+              "single_use",
+
+            fixed_amount:
+              true,
+
+            payment_amount:
+              PAYMENT_AMOUNT,
+
+            description:
+              "HELMI FRESH Helmet Sanitization",
+
+            close_by:
+              closeBy,
+
+            notes: {
+              reference_id:
+                referenceId,
+
+              amount:
+                "₹5",
+
+              source:
+                "HELMI FRESH ESP32",
             },
-
-            body:
-              JSON.stringify({
-
-                // ₹5
-                amount:
-                  AMOUNT,
-
-                currency:
-                  "INR",
-
-                accept_partial:
-                  false,
-
-                description:
-                  "HELMI FRESH Helmet Sanitization",
-
-                reference_id:
-                  referenceId,
-
-                reminder_enable:
-                  false,
-
-                // Razorpay Link:
-                // 16 minutes validity
-                expire_by:
-                  Math.floor(
-                    Date.now() / 1000
-                  ) +
-                  RAZORPAY_LINK_EXPIRY_SECONDS,
-              }),
           }
         );
 
 
-      const data =
-        await response.json();
-
-
-      if (!response.ok) {
+      if (
+        !createResult.response.ok
+      ) {
 
         return sendJson(
           res,
-          response.status,
+          createResult.response.status,
           {
             success: false,
+
             error:
-              data.error?.description ||
-              "Payment Link creation failed",
+              createResult.data?.error
+                ?.description ||
+              "Razorpay QR creation failed",
+          }
+        );
+      }
+
+
+      const qr =
+        createResult.data;
+
+      const qrId =
+        qr.id;
+
+
+      // ----------------------------------------------
+      // FETCH QR DETAILS
+      // image_content contains upi://pay...
+      // ----------------------------------------------
+
+      const fetchResult =
+        await razorpayRequest(
+          `/v1/payments/qr_codes/${encodeURIComponent(
+            qrId
+          )}`,
+          "GET"
+        );
+
+
+      if (
+        !fetchResult.response.ok
+      ) {
+
+        return sendJson(
+          res,
+          fetchResult.response.status,
+          {
+            success: false,
+
+            error:
+              fetchResult.data?.error
+                ?.description ||
+              "Unable to fetch QR details",
+          }
+        );
+      }
+
+
+      const qrDetails =
+        fetchResult.data;
+
+
+      const imageContent =
+        qrDetails.image_content;
+
+
+      if (
+        !imageContent ||
+        !imageContent.startsWith(
+          "upi://pay"
+        )
+      ) {
+
+        return sendJson(
+          res,
+          500,
+          {
+            success: false,
+
+            error:
+              "Direct UPI QR payload was not returned by Razorpay",
           }
         );
       }
@@ -386,28 +317,229 @@ export default async function handler(req, res) {
           // ₹5
           amount: 5,
 
-          // Razorpay Payment Link ID
-          payment_link_id:
-            data.id,
+          // QR ID
+          qr_id:
+            qrDetails.id,
 
-          // QR will use this URL
-          short_url:
-            data.short_url,
+          // DIRECT UPI PAYLOAD
+          upi_url:
+            imageContent,
 
-          // created
+          // QR status
           status:
-            data.status,
-
-          reference_id:
-            data.reference_id,
+            qrDetails.status,
 
           // ESP32 timer
           payment_timer_seconds:
-            PAYMENT_TIMEOUT_SECONDS,
+            PAYMENT_TIMER_SECONDS,
 
-          // Actual Razorpay link validity
-          razorpay_link_expiry_seconds:
-            RAZORPAY_LINK_EXPIRY_SECONDS,
+          // Razorpay server-side close time
+          razorpay_qr_close_by:
+            qrDetails.close_by,
+
+          // Useful reference
+          reference_id:
+            referenceId,
+        }
+      );
+    }
+
+
+    // ==================================================
+    // CHECK DIRECT UPI QR PAYMENT STATUS
+    // ==================================================
+
+    if (
+      req.method === "GET" &&
+      req.query?.action === "status"
+    ) {
+
+      const qrId =
+        req.query.qr_id;
+
+      if (!qrId) {
+
+        return sendJson(
+          res,
+          400,
+          {
+            success: false,
+            error:
+              "qr_id is required",
+          }
+        );
+      }
+
+
+      const result =
+        await razorpayRequest(
+          `/v1/payments/qr_codes/${encodeURIComponent(
+            qrId
+          )}/payments?count=10`,
+          "GET"
+        );
+
+
+      if (
+        !result.response.ok
+      ) {
+
+        return sendJson(
+          res,
+          result.response.status,
+          {
+            success: false,
+
+            error:
+              result.data?.error
+                ?.description ||
+              "Unable to check QR payment status",
+          }
+        );
+      }
+
+
+      const items =
+        Array.isArray(
+          result.data?.items
+        )
+          ? result.data.items
+          : [];
+
+
+      // Find a captured ₹5 payment
+      const paid =
+        items.find(
+          (payment) =>
+            payment.status === "captured" &&
+            Number(payment.amount) === PAYMENT_AMOUNT
+        );
+
+
+      if (paid) {
+
+        return sendJson(
+          res,
+          200,
+          {
+            success: true,
+
+            paid: true,
+
+            qr_id:
+              qrId,
+
+            payment_id:
+              paid.id,
+
+            amount:
+              paid.amount,
+
+            status:
+              paid.status,
+
+            method:
+              paid.method,
+
+            created_at:
+              paid.created_at,
+          }
+        );
+      }
+
+
+      return sendJson(
+        res,
+        200,
+        {
+          success: true,
+
+          paid: false,
+
+          qr_id:
+            qrId,
+
+          status:
+            "pending",
+        }
+      );
+    }
+
+
+    // ==================================================
+    // CLOSE DIRECT UPI QR
+    // ==================================================
+
+    if (
+      req.method === "POST" &&
+      req.headers[
+        "x-helmi-action"
+      ] === "cancel-payment"
+    ) {
+
+      const qrId =
+        req.query.qr_id;
+
+      if (!qrId) {
+
+        return sendJson(
+          res,
+          400,
+          {
+            success: false,
+            error:
+              "qr_id is required",
+          }
+        );
+      }
+
+
+      const result =
+        await razorpayRequest(
+          `/v1/payments/qr_codes/${encodeURIComponent(
+            qrId
+          )}/close`,
+          "POST",
+          {}
+        );
+
+
+      if (
+        !result.response.ok
+      ) {
+
+        return sendJson(
+          res,
+          result.response.status,
+          {
+            success: false,
+
+            error:
+              result.data?.error
+                ?.description ||
+              "QR close failed",
+          }
+        );
+      }
+
+
+      return sendJson(
+        res,
+        200,
+        {
+          success: true,
+
+          qr_id:
+            result.data.id,
+
+          status:
+            result.data.status,
+
+          closed_at:
+            result.data.closed_at,
+
+          close_reason:
+            result.data.close_reason,
         }
       );
     }
@@ -422,10 +554,8 @@ export default async function handler(req, res) {
       const rawBody =
         await readRawBody(req);
 
-
       const webhookSecret =
         process.env.RAZORPAY_WEBHOOK_SECRET;
-
 
       const signature =
         req.headers[
@@ -463,7 +593,6 @@ export default async function handler(req, res) {
       const received =
         Buffer.from(signature);
 
-
       const expected =
         Buffer.from(
           expectedSignature
@@ -473,7 +602,6 @@ export default async function handler(req, res) {
       if (
         received.length !==
           expected.length ||
-
         !crypto.timingSafeEqual(
           received,
           expected
@@ -535,7 +663,6 @@ export default async function handler(req, res) {
       "HELMI FRESH Payment Error:",
       error
     );
-
 
     return sendJson(
       res,
