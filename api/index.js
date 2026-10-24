@@ -100,7 +100,6 @@ function sleep(ms) {
 
 export default async function handler(req, res) {
   try {
-
     // ==================================================
     // HEALTH CHECK
     // ==================================================
@@ -342,12 +341,25 @@ export default async function handler(req, res) {
     // ==================================================
 
     if (req.method === "POST") {
+      // TEMPORARY DEBUG LOGS
+      // Do not log payment body or secret values.
+      console.log("[DEBUG] Webhook POST reached");
+
+      console.log(
+        "[DEBUG] Razorpay signature header present:",
+        typeof req.headers["x-razorpay-signature"] === "string"
+      );
+
       const rawBody = await readRawBody(req);
 
       const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
       const signature = req.headers["x-razorpay-signature"];
 
       if (!webhookSecret || typeof signature !== "string") {
+        console.error(
+          "[DEBUG] Webhook authentication failed: secret or signature missing"
+        );
+
         return sendJson(res, 401, {
           success: false,
           error: "Webhook authentication failed",
@@ -367,6 +379,8 @@ export default async function handler(req, res) {
         received.length !== expected.length ||
         !crypto.timingSafeEqual(received, expected)
       ) {
+        console.error("[DEBUG] Invalid webhook signature");
+
         return sendJson(res, 401, {
           success: false,
           error: "Invalid webhook signature",
@@ -378,6 +392,8 @@ export default async function handler(req, res) {
       try {
         event = JSON.parse(rawBody.toString("utf8"));
       } catch {
+        console.error("[DEBUG] Invalid webhook JSON");
+
         return sendJson(res, 400, {
           success: false,
           error: "Invalid webhook JSON",
@@ -398,6 +414,10 @@ export default async function handler(req, res) {
           const qrId = payment.qr_code_id;
           const paymentId = payment.id;
           const eventSecret = process.env.HELMI_EVENT_SECRET;
+
+          console.log("[DEBUG] Captured payment event verified");
+          console.log("[DEBUG] QR ID present:", Boolean(qrId));
+          console.log("[DEBUG] Payment ID present:", Boolean(paymentId));
 
           if (!qrId || !paymentId) {
             console.error(
@@ -422,6 +442,8 @@ export default async function handler(req, res) {
               error: "Event secret is not configured",
             });
           }
+
+          console.log("[DEBUG] Sending payment event to Hostinger");
 
           const hostingerResponse = await fetch(
             "https://helmifresh.in/api/payment-event.php",
@@ -448,6 +470,7 @@ export default async function handler(req, res) {
             hostingerResponse.status
           );
 
+          // Avoid logging any secret values.
           console.log(
             "Hostinger payment event response:",
             responseText
@@ -483,7 +506,13 @@ export default async function handler(req, res) {
             "Hostinger payment record saved:",
             paymentId
           );
+        } else {
+          console.log(
+            "[DEBUG] Payment event ignored: payment missing, status not captured, or amount mismatch"
+          );
         }
+      } else {
+        console.log("[DEBUG] Webhook event ignored:", event.event);
       }
 
       return sendJson(res, 200, {
