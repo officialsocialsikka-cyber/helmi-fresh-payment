@@ -11,10 +11,15 @@ const PAYMENT_AMOUNT = 500; // ₹5 in paise
 const PAYMENT_TIMER_SECONDS = 120;
 const QR_CLOSE_BY_SECONDS = 960;
 
+// Bound network waits so a slow upstream cannot stall a Vercel request indefinitely.
+const RAZORPAY_REQUEST_TIMEOUT_MS = 7000;
+const HOSTINGER_EVENT_TIMEOUT_MS = 4500;
+
 function sendJson(res, status, data) {
   res.status(status);
   res.setHeader("Content-Type", "application/json");
   res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Cache-Control", "no-store, max-age=0");
   return res.end(JSON.stringify(data));
 }
 
@@ -27,6 +32,17 @@ function razorpayAuth() {
   }
 
   return "Basic " + Buffer.from(`${keyId}:${keySecret}`).toString("base64");
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 7000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function readRawBody(req) {
@@ -52,7 +68,7 @@ async function razorpayRequest(path, method = "GET", body = null) {
     options.body = JSON.stringify(body);
   }
 
-  const response = await fetch(`https://api.razorpay.com${path}`, options);
+  const response = await fetchWithTimeout(`https://api.razorpay.com${path}`, options, RAZORPAY_REQUEST_TIMEOUT_MS);
   const text = await response.text();
 
   let data = {};
@@ -95,7 +111,7 @@ async function savePaymentToHostinger({ qrId, payment, eventId = "" }) {
     };
   }
 
-  const response = await fetch(
+  const response = await fetchWithTimeout(
     "https://helmifresh.in/api/payment-event.php",
     {
       method: "POST",
@@ -110,7 +126,8 @@ async function savePaymentToHostinger({ qrId, payment, eventId = "" }) {
         status: payment.status,
         event_id: eventId || `status-poll:${qrId}:${payment.id}`,
       }),
-    }
+    },
+    HOSTINGER_EVENT_TIMEOUT_MS
   );
 
   const responseText = await response.text();
@@ -259,7 +276,7 @@ export default async function handler(req, res) {
       }
 
       const result = await razorpayRequest(
-        `/v1/payments/qr_codes/${encodeURIComponent(qrId)}/payments?count=100`,
+        `/v1/payments/qr_codes/${encodeURIComponent(qrId)}/payments?count=10`,
         "GET"
       );
 
@@ -549,7 +566,7 @@ export default async function handler(req, res) {
 
         if (qrId) {
           const qrPaymentsResult = await razorpayRequest(
-            `/v1/payments/qr_codes/${encodeURIComponent(qrId)}/payments?count=100`,
+            `/v1/payments/qr_codes/${encodeURIComponent(qrId)}/payments?count=10`,
             "GET"
           );
 
