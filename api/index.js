@@ -1,4 +1,3 @@
-
 import crypto from "crypto";
 
 export const config = {
@@ -38,7 +37,10 @@ function razorpayAuth() {
     throw new Error("Razorpay API credentials are not configured");
   }
 
-  return "Basic " + Buffer.from(`${keyId}:${keySecret}`).toString("base64");
+  return (
+    "Basic " +
+    Buffer.from(`${keyId}:${keySecret}`).toString("base64")
+  );
 }
 
 // ==================================================
@@ -49,7 +51,9 @@ async function readRawBody(req) {
   const chunks = [];
 
   for await (const chunk of req) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    chunks.push(
+      Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    );
   }
 
   return Buffer.concat(chunks);
@@ -72,9 +76,12 @@ async function razorpayRequest(path, method = "GET", body = null) {
     options.body = JSON.stringify(body);
   }
 
-  const response = await fetch(`https://api.razorpay.com${path}`, options);
-  const text = await response.text();
+  const response = await fetch(
+    `https://api.razorpay.com${path}`,
+    options
+  );
 
+  const text = await response.text();
   let data = {};
 
   try {
@@ -92,6 +99,102 @@ async function razorpayRequest(path, method = "GET", body = null) {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ==================================================
+// SAVE VERIFIED PAYMENT TO HOSTINGER
+// ==================================================
+
+async function savePaymentToHostinger({
+  qrId,
+  payment,
+  eventId = "",
+}) {
+  if (!qrId || !payment?.id) {
+    console.error("[DEBUG] QR ID or payment ID missing");
+    return {
+      saved: false,
+      error: "QR ID or payment ID missing",
+    };
+  }
+
+  if (
+    payment.status !== "captured" ||
+    Number(payment.amount) !== PAYMENT_AMOUNT
+  ) {
+    return {
+      saved: false,
+      error: "Payment is not a captured ₹5 payment",
+    };
+  }
+
+  const eventSecret = process.env.HELMI_EVENT_SECRET;
+
+  if (!eventSecret) {
+    console.error("[DEBUG] HELMI_EVENT_SECRET is missing");
+    return {
+      saved: false,
+      error: "HELMI_EVENT_SECRET is not configured",
+    };
+  }
+
+  console.log("[DEBUG] Forwarding payment to Hostinger");
+
+  const response = await fetch(
+    "https://helmifresh.in/api/payment-event.php",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Helmi-Event-Secret": eventSecret,
+      },
+      body: JSON.stringify({
+        qr_id: qrId,
+        payment_id: payment.id,
+        amount: payment.amount,
+        status: payment.status,
+        event_id:
+          eventId ||
+          `status-poll:${qrId}:${payment.id}`,
+      }),
+    }
+  );
+
+  const responseText = await response.text();
+  let data = null;
+
+  try {
+    data = JSON.parse(responseText);
+  } catch {
+    console.error(
+      "[DEBUG] Hostinger response is not JSON"
+    );
+  }
+
+  console.log(
+    "[DEBUG] Hostinger payment event HTTP:",
+    response.status
+  );
+
+  if (!response.ok || !data?.success || !data?.saved) {
+    console.error(
+      "[DEBUG] Hostinger save failed:",
+      response.status,
+      responseText
+    );
+
+    return {
+      saved: false,
+      error: "Hostinger database save failed",
+    };
+  }
+
+  console.log(
+    "[DEBUG] Hostinger payment record saved:",
+    payment.id
+  );
+
+  return { saved: true };
 }
 
 // ==================================================
@@ -120,7 +223,9 @@ export default async function handler(req, res) {
       req.headers["x-helmi-action"] === "create-payment"
     ) {
       const referenceId = `HELMI-${Date.now()}`;
-      const closeBy = Math.floor(Date.now() / 1000) + QR_CLOSE_BY_SECONDS;
+      const closeBy =
+        Math.floor(Date.now() / 1000) +
+        QR_CLOSE_BY_SECONDS;
 
       const createResult = await razorpayRequest(
         "/v1/payments/qr_codes",
@@ -140,25 +245,29 @@ export default async function handler(req, res) {
         }
       );
 
-      console.log("Razorpay CREATE HTTP:", createResult.response.status);
-      console.log("Razorpay CREATE RESPONSE:", createResult.data);
+      console.log(
+        "Razorpay CREATE HTTP:",
+        createResult.response.status
+      );
 
       if (!createResult.response.ok) {
-        return sendJson(res, createResult.response.status, {
-          success: false,
-          error:
-            createResult.data?.error?.description ||
-            createResult.data?.raw ||
-            "Razorpay QR creation failed",
-        });
+        return sendJson(
+          res,
+          createResult.response.status,
+          {
+            success: false,
+            error:
+              createResult.data?.error?.description ||
+              createResult.data?.raw ||
+              "Razorpay QR creation failed",
+          }
+        );
       }
 
       const qr = createResult.data;
       const qrId = qr?.id;
 
       if (!qrId) {
-        console.error("QR ID missing");
-
         return sendJson(res, 500, {
           success: false,
           error: "Razorpay QR ID missing",
@@ -167,17 +276,15 @@ export default async function handler(req, res) {
 
       console.log("QR CREATED:", qrId);
 
-      // ==================================================
       // GET DIRECT UPI PAYLOAD
-      // ==================================================
 
       let upiUrl = qr?.image_content || "";
 
       if (!upiUrl.startsWith("upi://pay")) {
-        console.log("Starting QR FETCH retries...");
-
         for (let attempt = 1; attempt <= 5; attempt++) {
-          console.log(`QR FETCH attempt ${attempt}/5`);
+          console.log(
+            `QR FETCH attempt ${attempt}/5`
+          );
 
           await sleep(1500);
 
@@ -186,26 +293,23 @@ export default async function handler(req, res) {
             "GET"
           );
 
-          console.log("QR FETCH HTTP:", fetchResult.response.status);
-
           if (
             fetchResult.response.ok &&
-            fetchResult.data?.image_content &&
-            fetchResult.data.image_content.startsWith("upi://pay")
+            fetchResult.data?.image_content?.startsWith(
+              "upi://pay"
+            )
           ) {
             upiUrl = fetchResult.data.image_content;
-            console.log("DIRECT UPI PAYLOAD FOUND");
             break;
           }
         }
       }
 
-      if (!upiUrl || !upiUrl.startsWith("upi://pay")) {
-        console.error("DIRECT UPI PAYLOAD NOT FOUND");
-
+      if (!upiUrl.startsWith("upi://pay")) {
         return sendJson(res, 500, {
           success: false,
-          error: "QR was created but direct UPI payload was not available",
+          error:
+            "QR was created but direct UPI payload was not available",
           qr_id: qrId,
           image_url: qr?.image_url || null,
         });
@@ -224,7 +328,7 @@ export default async function handler(req, res) {
     }
 
     // ==================================================
-    // CHECK QR PAYMENT STATUS
+    // CHECK QR PAYMENT STATUS + SAVE TO MYSQL
     // ==================================================
 
     if (
@@ -233,10 +337,14 @@ export default async function handler(req, res) {
     ) {
       const qrId = req.query.qr_id;
 
-      if (!qrId) {
+      if (
+        !qrId ||
+        typeof qrId !== "string" ||
+        !/^qr_[A-Za-z0-9]+$/.test(qrId)
+      ) {
         return sendJson(res, 400, {
           success: false,
-          error: "qr_id is required",
+          error: "A valid qr_id is required",
         });
       }
 
@@ -245,16 +353,23 @@ export default async function handler(req, res) {
         "GET"
       );
 
-      console.log("QR PAYMENT STATUS HTTP:", result.response.status);
+      console.log(
+        "QR PAYMENT STATUS HTTP:",
+        result.response.status
+      );
 
       if (!result.response.ok) {
-        return sendJson(res, result.response.status, {
-          success: false,
-          error:
-            result.data?.error?.description ||
-            result.data?.raw ||
-            "Unable to check QR payment status",
-        });
+        return sendJson(
+          res,
+          result.response.status,
+          {
+            success: false,
+            error:
+              result.data?.error?.description ||
+              result.data?.raw ||
+              "Unable to check QR payment status",
+          }
+        );
       }
 
       const items = Array.isArray(result.data?.items)
@@ -264,15 +379,43 @@ export default async function handler(req, res) {
       const paidPayment = items.find(
         payment =>
           payment.status === "captured" &&
-          Number(payment.amount) === PAYMENT_AMOUNT
+          Number(payment.amount) === PAYMENT_AMOUNT &&
+          payment.qr_code_id === qrId
       );
 
       if (paidPayment) {
-        console.log("PAYMENT CAPTURED:", paidPayment.id);
+        console.log(
+          "PAYMENT CAPTURED:",
+          paidPayment.id
+        );
+
+        let saveResult;
+
+        try {
+          saveResult = await savePaymentToHostinger({
+            qrId,
+            payment: paidPayment,
+            eventId: `status-poll:${qrId}:${paidPayment.id}`,
+          });
+        } catch (error) {
+          console.error(
+            "[DEBUG] Hostinger save exception:",
+            error
+          );
+
+          saveResult = {
+            saved: false,
+            error: "Hostinger save request failed",
+          };
+        }
 
         return sendJson(res, 200, {
           success: true,
           paid: true,
+          saved: saveResult.saved,
+          save_error: saveResult.saved
+            ? undefined
+            : saveResult.error,
           qr_id: qrId,
           payment_id: paidPayment.id,
           amount: paidPayment.amount,
@@ -300,10 +443,14 @@ export default async function handler(req, res) {
     ) {
       const qrId = req.query.qr_id;
 
-      if (!qrId) {
+      if (
+        !qrId ||
+        typeof qrId !== "string" ||
+        !/^qr_[A-Za-z0-9]+$/.test(qrId)
+      ) {
         return sendJson(res, 400, {
           success: false,
-          error: "qr_id is required",
+          error: "A valid qr_id is required",
         });
       }
 
@@ -313,16 +460,23 @@ export default async function handler(req, res) {
         {}
       );
 
-      console.log("QR CLOSE HTTP:", result.response.status);
+      console.log(
+        "QR CLOSE HTTP:",
+        result.response.status
+      );
 
       if (!result.response.ok) {
-        return sendJson(res, result.response.status, {
-          success: false,
-          error:
-            result.data?.error?.description ||
-            result.data?.raw ||
-            "QR close failed",
-        });
+        return sendJson(
+          res,
+          result.response.status,
+          {
+            success: false,
+            error:
+              result.data?.error?.description ||
+              result.data?.raw ||
+              "QR close failed",
+          }
+        );
       }
 
       return sendJson(res, 200, {
@@ -335,18 +489,25 @@ export default async function handler(req, res) {
     }
 
     // ==================================================
-    // RAZORPAY WEBHOOK + HOSTINGER DATABASE FORWARDING
+    // RAZORPAY WEBHOOK
     // ==================================================
 
     if (req.method === "POST") {
       console.log("[DEBUG] Webhook POST reached");
 
       const rawBody = await readRawBody(req);
-      const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
-      const signature = req.headers["x-razorpay-signature"];
+      const webhookSecret =
+        process.env.RAZORPAY_WEBHOOK_SECRET;
+      const signature =
+        req.headers["x-razorpay-signature"];
 
-      if (!webhookSecret || typeof signature !== "string") {
-        console.error("[DEBUG] Webhook secret/signature missing");
+      if (
+        !webhookSecret ||
+        typeof signature !== "string"
+      ) {
+        console.error(
+          "[DEBUG] Webhook secret/signature missing"
+        );
 
         return sendJson(res, 401, {
           success: false,
@@ -354,20 +515,24 @@ export default async function handler(req, res) {
         });
       }
 
-      // Verify Razorpay signature against the exact raw request body.
       const expectedSignature = crypto
         .createHmac("sha256", webhookSecret)
         .update(rawBody)
         .digest("hex");
 
       const received = Buffer.from(signature, "utf8");
-      const expected = Buffer.from(expectedSignature, "utf8");
+      const expected = Buffer.from(
+        expectedSignature,
+        "utf8"
+      );
 
       if (
         received.length !== expected.length ||
         !crypto.timingSafeEqual(received, expected)
       ) {
-        console.error("[DEBUG] Invalid webhook signature");
+        console.error(
+          "[DEBUG] Invalid webhook signature"
+        );
 
         return sendJson(res, 401, {
           success: false,
@@ -380,31 +545,30 @@ export default async function handler(req, res) {
       try {
         event = JSON.parse(rawBody.toString("utf8"));
       } catch {
-        console.error("[DEBUG] Invalid webhook JSON");
-
         return sendJson(res, 400, {
           success: false,
           error: "Invalid webhook JSON",
         });
       }
 
-      console.log("[DEBUG] Verified event:", event.event);
+      console.log(
+        "[DEBUG] Verified event:",
+        event.event
+      );
 
       let qrId = null;
       let payment = null;
 
-      // --------------------------------------------------
-      // EVENT: payment.captured
-      // --------------------------------------------------
+      // PAYMENT CAPTURED EVENT
 
       if (event.event === "payment.captured") {
         payment = event.payload?.payment?.entity || null;
         qrId = payment?.qr_code_id || null;
 
-        // If the webhook does not include QR ID, fetch
-        // the payment details from Razorpay.
         if (payment?.id && !qrId) {
-          console.log("[DEBUG] Fetching full payment details");
+          console.log(
+            "[DEBUG] Fetching full payment details"
+          );
 
           const paymentResult = await razorpayRequest(
             `/v1/payments/${encodeURIComponent(payment.id)}`,
@@ -423,19 +587,21 @@ export default async function handler(req, res) {
         }
       }
 
-      // --------------------------------------------------
-      // EVENT: qr_code.credited
-      // --------------------------------------------------
+      // QR CODE CREDITED EVENT
 
       if (event.event === "qr_code.credited") {
-        const qrEntity = event.payload?.qr_code?.entity;
+        const qrEntity =
+          event.payload?.qr_code?.entity;
 
         qrId =
           qrEntity?.id ||
           event.payload?.qr_code?.id ||
           null;
 
-        console.log("[DEBUG] QR credited; QR ID present:", Boolean(qrId));
+        console.log(
+          "[DEBUG] QR credited; QR ID present:",
+          Boolean(qrId)
+        );
 
         if (qrId) {
           const qrPaymentsResult = await razorpayRequest(
@@ -449,15 +615,15 @@ export default async function handler(req, res) {
           );
 
           if (!qrPaymentsResult.response.ok) {
-            console.error("[DEBUG] Failed to retrieve QR payments");
-
             return sendJson(res, 502, {
               success: false,
               error: "Unable to retrieve QR payments",
             });
           }
 
-          const items = Array.isArray(qrPaymentsResult.data?.items)
+          const items = Array.isArray(
+            qrPaymentsResult.data?.items
+          )
             ? qrPaymentsResult.data.items
             : [];
 
@@ -465,17 +631,22 @@ export default async function handler(req, res) {
             items.find(
               item =>
                 item.status === "captured" &&
-                Number(item.amount) === PAYMENT_AMOUNT
+                Number(item.amount) === PAYMENT_AMOUNT &&
+                item.qr_code_id === qrId
             ) || null;
         }
       }
 
-      // Ignore unrelated events.
+      // IGNORE UNRELATED EVENTS
+
       if (
         event.event !== "payment.captured" &&
         event.event !== "qr_code.credited"
       ) {
-        console.log("[DEBUG] Event ignored:", event.event);
+        console.log(
+          "[DEBUG] Event ignored:",
+          event.event
+        );
 
         return sendJson(res, 200, {
           received: true,
@@ -484,13 +655,16 @@ export default async function handler(req, res) {
         });
       }
 
-      // Only accept a captured payment of exactly ₹5.
+      // VALIDATE PAYMENT
+
       if (
         !payment ||
         payment.status !== "captured" ||
         Number(payment.amount) !== PAYMENT_AMOUNT
       ) {
-        console.log("[DEBUG] Captured ₹5 payment not found");
+        console.log(
+          "[DEBUG] Captured ₹5 payment not found"
+        );
 
         return sendJson(res, 200, {
           received: true,
@@ -501,89 +675,50 @@ export default async function handler(req, res) {
       }
 
       const paymentId = payment.id;
-      const eventSecret = process.env.HELMI_EVENT_SECRET;
 
-      console.log("[DEBUG] Payment ID present:", Boolean(paymentId));
-      console.log("[DEBUG] QR ID present:", Boolean(qrId));
+      console.log(
+        "[DEBUG] Payment ID present:",
+        Boolean(paymentId)
+      );
+
+      console.log(
+        "[DEBUG] QR ID present:",
+        Boolean(qrId)
+      );
 
       if (!qrId || !paymentId) {
-        console.error("[DEBUG] QR ID or payment ID missing after lookup");
+        console.error(
+          "[DEBUG] QR ID or payment ID missing after lookup"
+        );
 
+        // Status polling may still save the payment
+        // because it already knows the QR ID.
         return sendJson(res, 200, {
           received: true,
           verified: true,
           forwarded: false,
-          reason: "QR ID or payment ID missing after lookup",
+          reason: "QR ID missing; status API fallback available",
         });
       }
 
-      if (!eventSecret) {
-        console.error("[DEBUG] HELMI_EVENT_SECRET is not configured");
+      // FORWARD VERIFIED PAYMENT TO HOSTINGER
 
-        return sendJson(res, 500, {
-          success: false,
-          error: "Event secret is not configured",
-        });
-      }
+      const saveResult = await savePaymentToHostinger({
+        qrId,
+        payment,
+        eventId: event.id || "",
+      });
 
-      // --------------------------------------------------
-      // FORWARD PAYMENT TO HOSTINGER
-      // --------------------------------------------------
-
-      console.log("[DEBUG] Forwarding payment to Hostinger");
-
-      const hostingerResponse = await fetch(
-        "https://helmifresh.in/api/payment-event.php",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-Helmi-Event-Secret": eventSecret,
-          },
-          body: JSON.stringify({
-            qr_id: qrId,
-            payment_id: paymentId,
-            amount: payment.amount,
-            status: payment.status,
-            event_id: event.id || "",
-          }),
-        }
-      );
-
-      const responseText = await hostingerResponse.text();
-
-      console.log(
-        "[DEBUG] Hostinger payment event HTTP:",
-        hostingerResponse.status
-      );
-
-      if (!hostingerResponse.ok) {
-        console.error("[DEBUG] Hostinger payment event failed");
-
+      if (!saveResult.saved) {
         return sendJson(res, 502, {
           success: false,
-          error: "Hostinger payment event failed",
+          received: true,
+          verified: true,
+          forwarded: false,
+          saved: false,
+          error: saveResult.error,
         });
       }
-
-      let hostingerData;
-
-      try {
-        hostingerData = JSON.parse(responseText);
-      } catch {
-        hostingerData = null;
-      }
-
-      if (!hostingerData?.success || !hostingerData?.saved) {
-        console.error("[DEBUG] Hostinger did not confirm database save");
-
-        return sendJson(res, 502, {
-          success: false,
-          error: "Hostinger did not confirm database save",
-        });
-      }
-
-      console.log("[DEBUG] Hostinger payment record saved");
 
       return sendJson(res, 200, {
         received: true,
@@ -601,9 +736,11 @@ export default async function handler(req, res) {
       success: false,
       error: "Method not allowed",
     });
-
   } catch (error) {
-    console.error("HELMI FRESH PAYMENT ERROR:", error);
+    console.error(
+      "HELMI FRESH PAYMENT ERROR:",
+      error
+    );
 
     return sendJson(res, 500, {
       success: false,
