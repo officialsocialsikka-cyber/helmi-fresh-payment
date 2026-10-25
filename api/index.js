@@ -71,7 +71,6 @@ function sleep(ms) {
 }
 
 // Save a verified captured payment to Hostinger.
-// Called by the status endpoint and the webhook.
 async function savePaymentToHostinger({ qrId, payment, eventId = "" }) {
   if (!qrId || !payment?.id) {
     return { saved: false, error: "QR ID or payment ID is missing" };
@@ -115,7 +114,6 @@ async function savePaymentToHostinger({ qrId, payment, eventId = "" }) {
   );
 
   const responseText = await response.text();
-
   let data = null;
 
   try {
@@ -140,7 +138,6 @@ async function savePaymentToHostinger({ qrId, payment, eventId = "" }) {
   }
 
   console.log("[DEBUG] Hostinger payment record saved:", payment.id);
-
   return { saved: true };
 }
 
@@ -209,7 +206,6 @@ export default async function handler(req, res) {
       if (!upiUrl.startsWith("upi://pay")) {
         for (let attempt = 1; attempt <= 5; attempt++) {
           console.log(`QR FETCH attempt ${attempt}/5`);
-
           await sleep(1500);
 
           const fetchResult = await razorpayRequest(
@@ -298,10 +294,6 @@ export default async function handler(req, res) {
         });
       }
 
-      console.log("PAYMENT CAPTURED:", paidPayment.id);
-
-      // QR ID is known from the status request.
-      // This avoids relying on qr_code_id in the webhook payload.
       let saveResult;
 
       try {
@@ -329,6 +321,122 @@ export default async function handler(req, res) {
         status: paidPayment.status,
         method: paidPayment.method,
         created_at: paidPayment.created_at,
+      });
+    }
+
+    // RECOVER OLD CAPTURED PAYMENT
+    if (
+      req.method === "GET" &&
+      req.query?.action === "recover-payment"
+    ) {
+      const paymentId = req.query.payment_id;
+
+      if (
+        typeof paymentId !== "string" ||
+        !/^pay_[A-Za-z0-9]+$/.test(paymentId)
+      ) {
+        return sendJson(res, 400, {
+          success: false,
+          error: "Valid payment_id is required",
+        });
+      }
+
+      // Fetch payment details directly from Razorpay.
+      const paymentResult = await razorpayRequest(
+        `/v1/payments/${encodeURIComponent(paymentId)}`,
+        "GET"
+      );
+
+      if (!paymentResult.response.ok) {
+        return sendJson(res, paymentResult.response.status, {
+          success: false,
+          step: "fetch_payment",
+          error:
+            paymentResult.data?.error?.description ||
+            paymentResult.data?.raw ||
+            "Unable to fetch payment from Razorpay",
+        });
+      }
+
+      const payment = paymentResult.data;
+
+      // Only accept a captured payment of the expected amount.
+      if (
+        payment.status !== "captured" ||
+        Number(payment.amount) !== PAYMENT_AMOUNT
+      ) {
+        return sendJson(res, 400, {
+          success: false,
+          error: "Payment is not a captured ₹5 payment",
+          payment_id: payment.id,
+          status: payment.status,
+          amount: payment.amount,
+        });
+      }
+
+      // Try to find the QR associated with the payment.
+      const qrResult = await razorpayRequest(
+        `/v1/payments/qr_codes?payment_id=${encodeURIComponent(paymentId)}`,
+        "GET"
+      );
+
+      if (!qrResult.response.ok) {
+        return sendJson(res, qrResult.response.status, {
+          success: false,
+          step: "find_qr",
+          error:
+            qrResult.data?.error?.description ||
+            qrResult.data?.raw ||
+            "Unable to find QR code for this payment",
+        });
+      }
+
+      const qrItems = Array.isArray(qrResult.data?.items)
+        ? qrResult.data.items
+        : [];
+
+      const qrId =
+        payment.qr_code_id ||
+        qrItems.find(item => item?.id)?.id ||
+        null;
+
+      if (!qrId) {
+        return sendJson(res, 404, {
+          success: false,
+          step: "find_qr",
+          error:
+            "Payment is captured, but Razorpay did not return an associated QR ID. Nothing was saved.",
+          payment_id: payment.id,
+          status: payment.status,
+          amount: payment.amount,
+        });
+      }
+
+      let saveResult;
+
+      try {
+        saveResult = await savePaymentToHostinger({
+          qrId,
+          payment,
+          eventId: `manual-recovery:${payment.id}`,
+        });
+      } catch (error) {
+        console.error("[DEBUG] Recovery save failed:", error);
+        saveResult = {
+          saved: false,
+          error: "Hostinger save request failed",
+        };
+      }
+
+      return sendJson(res, saveResult.saved ? 200 : 502, {
+        success: saveResult.saved,
+        paid: true,
+        saved: saveResult.saved,
+        save_error: saveResult.saved ? undefined : saveResult.error,
+        qr_id: qrId,
+        payment_id: payment.id,
+        amount: payment.amount,
+        status: payment.status,
       });
     }
 
@@ -429,11 +537,9 @@ export default async function handler(req, res) {
         payment = event.payload?.payment?.entity || null;
         qrId = payment?.qr_code_id || null;
 
-        // A payment lookup may not contain qr_code_id.
-        // The status endpoint is the fallback for saving.
         if (payment?.id && !qrId) {
           console.log(
-            "[DEBUG] QR ID absent from payment.captured payload; status polling can save it"
+            "[DEBUG] QR ID absent from payment.captured payload; recovery endpoint may be needed"
           );
         }
       } else if (event.event === "qr_code.credited") {
@@ -487,13 +593,11 @@ export default async function handler(req, res) {
       }
 
       if (!qrId) {
-        // Do not invent or guess the QR ID.
-        // Razorpay's status API can save the payment once called with qr_id.
         return sendJson(res, 200, {
           received: true,
           verified: true,
           forwarded: false,
-          reason: "QR ID missing; status API fallback is required",
+          reason: "QR ID missing; use the recovery endpoint if needed",
           payment_id: payment.id,
         });
       }
