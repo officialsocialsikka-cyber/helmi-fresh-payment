@@ -7,52 +7,55 @@ export const config = {
   },
 };
 
-const PAYMENT_AMOUNT = 500; // ₹5 in paise
+const DEVICE_ID = process.env.HELMI_DEVICE_ID || "HF-WROOM-01";
 const PAYMENT_TIMER_SECONDS = 120;
 const QR_CLOSE_BY_SECONDS = 960;
-
-// Bound network waits so a slow upstream cannot stall a Vercel request indefinitely.
-const RAZORPAY_REQUEST_TIMEOUT_MS = 7000;
-const HOSTINGER_EVENT_TIMEOUT_MS = 4500;
+const RAZORPAY_TIMEOUT_MS = 7000;
+const HOSTINGER_TIMEOUT_MS = 5000;
 
 function sendJson(res, status, data) {
   res.status(status);
-  res.setHeader("Content-Type", "application/json");
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, X-Helmi-Action"
+  );
   res.setHeader("Cache-Control", "no-store, max-age=0");
   return res.end(JSON.stringify(data));
 }
 
-function razorpayAuth() {
-  const keyId = process.env.RAZORPAY_KEY_ID;
-  const keySecret = process.env.RAZORPAY_KEY_SECRET;
-
-  if (!keyId || !keySecret) {
-    throw new Error("Razorpay API credentials are not configured");
+function requiredEnv(name) {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`${name} is not configured`);
   }
-
-  return "Basic " + Buffer.from(`${keyId}:${keySecret}`).toString("base64");
+  return value;
 }
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = 7000) {
+function razorpayAuth() {
+  const keyId = requiredEnv("RAZORPAY_KEY_ID");
+  const keySecret = requiredEnv("RAZORPAY_KEY_SECRET");
+
+  return (
+    "Basic " +
+    Buffer.from(`${keyId}:${keySecret}`).toString("base64")
+  );
+}
+
+async function fetchTimeout(url, options = {}, timeoutMs = 7000) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
   } finally {
-    clearTimeout(timeout);
+    clearTimeout(timer);
   }
-}
-
-async function readRawBody(req) {
-  const chunks = [];
-
-  for await (const chunk of req) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  }
-
-  return Buffer.concat(chunks);
 }
 
 async function razorpayRequest(path, method = "GET", body = null) {
@@ -68,51 +71,185 @@ async function razorpayRequest(path, method = "GET", body = null) {
     options.body = JSON.stringify(body);
   }
 
-  const response = await fetchWithTimeout(`https://api.razorpay.com${path}`, options, RAZORPAY_REQUEST_TIMEOUT_MS);
-  const text = await response.text();
+  const response = await fetchTimeout(
+    `https://api.razorpay.com${path}`,
+    options,
+    RAZORPAY_TIMEOUT_MS
+  );
 
+  const raw = await response.text();
   let data = {};
 
   try {
-    data = text ? JSON.parse(text) : {};
+    data = raw ? JSON.parse(raw) : {};
   } catch {
-    data = { raw: text };
+    data = { raw };
   }
 
   return { response, data };
 }
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+// Hostinger server-to-server bridge
+async function bridgeRequest(
+  action,
+  { method = "GET", query = {}, body = null } = {}
+) {
+  const base = requiredEnv("HELMI_PAYMENT_BRIDGE_URL");
+  const secret = requiredEnv("HELMI_CONFIG_SECRET");
+  const url = new URL(base);
 
-// Save a verified captured payment to Hostinger.
-async function savePaymentToHostinger({ qrId, payment, eventId = "" }) {
-  if (!qrId || !payment?.id) {
-    return { saved: false, error: "QR ID or payment ID is missing" };
+  if (method === "GET") {
+    url.searchParams.set("action", action);
+
+    for (const [key, value] of Object.entries(query)) {
+      url.searchParams.set(key, String(value));
+    }
   }
 
+  const response = await fetchTimeout(
+    url.toString(),
+    {
+      method,
+      headers: {
+        "X-Helmi-Config-Secret": secret,
+        "Content-Type": "application/json",
+      },
+      ...(body
+        ? { body: JSON.stringify({ action, ...body }) }
+        : {}),
+    },
+    HOSTINGER_TIMEOUT_MS
+  );
+
+  const raw = await response.text();
+  let data;
+
+  try {
+    data = raw ? JSON.parse(raw) : {};
+  } catch {
+    throw new Error("Hostinger bridge returned invalid JSON");
+  }
+
+  if (!response.ok || !data.success) {
+    throw new Error(
+      data.error || `Hostinger bridge HTTP ${response.status}`
+    );
+  }
+
+  return data;
+}
+
+// Read the current amount from Admin Panel
+async function getCurrentConfig() {
+  const result = await bridgeRequest("config", {
+    query: {
+      device_id: DEVICE_ID,
+    },
+  });
+
+  const amount = Number(result.payment?.amount_paise);
+  const version = Number(result.config_version);
+
+  if (!Number.isSafeInteger(amount) || amount <= 0) {
+    throw new Error("Admin Panel payment amount is invalid");
+  }
+
+  if (result.payment?.currency !== "INR") {
+    throw new Error("Only INR payments are supported");
+  }
+
+  if (result.payment?.gateway_enabled !== true) {
+    throw new Error("Payment gateway is disabled in Admin Panel");
+  }
+
+  if (!Number.isSafeInteger(version) || version <= 0) {
+    throw new Error("Admin configuration version is invalid");
+  }
+
+  return {
+    amountPaise: amount,
+    configVersion: version,
+    deviceId: result.device_id,
+  };
+}
+
+function expiryLocalString(unixSeconds) {
+  const d = new Date(unixSeconds * 1000 + 330 * 60 * 1000);
+
+  return (
+    `${d.getUTCFullYear()}-` +
+    `${String(d.getUTCMonth() + 1).padStart(2, "0")}-` +
+    `${String(d.getUTCDate()).padStart(2, "0")} ` +
+    `${String(d.getUTCHours()).padStart(2, "0")}:` +
+    `${String(d.getUTCMinutes()).padStart(2, "0")}:` +
+    `${String(d.getUTCSeconds()).padStart(2, "0")}`
+  );
+}
+
+// Read immutable amount saved for a QR
+async function getQrSession(qrId) {
+  const result = await bridgeRequest("session", {
+    query: {
+      qr_id: qrId,
+    },
+  });
+
+  const session = result.session;
+
   if (
-    payment.status !== "captured" ||
-    Number(payment.amount) !== PAYMENT_AMOUNT
+    !session ||
+    session.qr_id !== qrId ||
+    session.currency !== "INR" ||
+    !Number.isSafeInteger(
+      Number(session.expected_amount_paise)
+    ) ||
+    Number(session.expected_amount_paise) <= 0
+  ) {
+    throw new Error("QR session data is invalid");
+  }
+
+  return {
+    ...session,
+    expected_amount_paise: Number(
+      session.expected_amount_paise
+    ),
+  };
+}
+
+// Save only a captured payment matching the QR session
+async function savePaymentToHostinger({
+  qrId,
+  payment,
+  eventId = "",
+}) {
+  if (
+    !qrId ||
+    !payment?.id ||
+    payment.status !== "captured"
   ) {
     return {
       saved: false,
-      error: "Payment is not a captured ₹5 payment",
+      error: "Payment is not captured",
     };
   }
 
-  const eventSecret = process.env.HELMI_EVENT_SECRET;
+  const session = await getQrSession(qrId);
 
-  if (!eventSecret) {
+  if (
+    Number(payment.amount) !==
+      session.expected_amount_paise ||
+    (payment.currency && payment.currency !== "INR")
+  ) {
     return {
       saved: false,
-      error: "HELMI_EVENT_SECRET is not configured",
+      error: "Payment amount does not match QR session",
     };
   }
 
-  const response = await fetchWithTimeout(
-    "https://helmifresh.in/api/payment-event.php",
+  const eventSecret = requiredEnv("HELMI_EVENT_SECRET");
+
+  const response = await fetchTimeout(
+    "https://helmifresh.in/api/payment-event-dynamic.php",
     {
       method: "POST",
       headers: {
@@ -124,171 +261,407 @@ async function savePaymentToHostinger({ qrId, payment, eventId = "" }) {
         payment_id: payment.id,
         amount: Number(payment.amount),
         status: payment.status,
-        event_id: eventId || `status-poll:${qrId}:${payment.id}`,
+        event_id:
+          eventId || `status-poll:${qrId}:${payment.id}`,
       }),
     },
-    HOSTINGER_EVENT_TIMEOUT_MS
+    HOSTINGER_TIMEOUT_MS
   );
 
-  const responseText = await response.text();
+  const raw = await response.text();
   let data = null;
 
   try {
-    data = responseText ? JSON.parse(responseText) : null;
+    data = raw ? JSON.parse(raw) : null;
   } catch {
     data = null;
   }
 
-  console.log("[DEBUG] Hostinger payment event HTTP:", response.status);
-
   if (!response.ok || !data?.success || !data?.saved) {
-    console.error(
-      "[DEBUG] Hostinger payment save failed:",
-      response.status,
-      responseText
-    );
-
     return {
       saved: false,
-      error: data?.error || "Hostinger did not confirm database save",
+      error:
+        data?.error ||
+        `Hostinger event endpoint HTTP ${response.status}`,
     };
   }
 
-  console.log("[DEBUG] Hostinger payment record saved:", payment.id);
   return { saved: true };
 }
 
-export default async function handler(req, res) {
+async function closeRazorpayQr(qrId) {
   try {
-    // HEALTH CHECK
-    if (req.method === "GET" && !req.query?.action) {
-      return sendJson(res, 200, {
-        status: "online",
-        service: "HELMI FRESH UPI QR Payment Server",
-      });
+    await razorpayRequest(
+      `/v1/payments/qr_codes/${encodeURIComponent(qrId)}/close`,
+      "POST",
+      {}
+    );
+  } catch (error) {
+    console.error("QR close request failed:", error);
+  }
+}
+
+// Create QR using Admin Panel amount
+async function createPayment(res) {
+  const cfg = await getCurrentConfig();
+
+  const closeBy =
+    Math.floor(Date.now() / 1000) + QR_CLOSE_BY_SECONDS;
+
+  const referenceId = `HELMI-${Date.now()}`;
+
+  const created = await razorpayRequest(
+    "/v1/payments/qr_codes",
+    "POST",
+    {
+      type: "upi_qr",
+      name: "HELMI FRESH",
+      usage: "single_use",
+      fixed_amount: true,
+      payment_amount: cfg.amountPaise,
+      description: "HELMI FRESH Helmet Sanitization",
+      close_by: closeBy,
+      notes: {
+        reference_id: referenceId,
+        purpose: "Helmet Sanitization",
+        device_id: cfg.deviceId,
+        config_version: String(cfg.configVersion),
+      },
     }
+  );
 
-    // CREATE QR PAYMENT
-    if (
-      req.method === "POST" &&
-      req.headers["x-helmi-action"] === "create-payment"
-    ) {
-      const referenceId = `HELMI-${Date.now()}`;
-      const closeBy = Math.floor(Date.now() / 1000) + QR_CLOSE_BY_SECONDS;
+  if (!created.response.ok) {
+    return sendJson(res, created.response.status, {
+      success: false,
+      error:
+        created.data?.error?.description ||
+        "Razorpay QR creation failed",
+    });
+  }
 
-      const createResult = await razorpayRequest(
-        "/v1/payments/qr_codes",
-        "POST",
-        {
-          type: "upi_qr",
-          name: "HELMI FRESH",
-          usage: "single_use",
-          fixed_amount: true,
-          payment_amount: PAYMENT_AMOUNT,
-          description: "HELMI FRESH Helmet Sanitization",
-          close_by: closeBy,
-          notes: {
-            reference_id: referenceId,
-            purpose: "Helmet Sanitization",
-          },
-        }
+  const qr = created.data;
+  const qrId = qr?.id;
+
+  if (
+    typeof qrId !== "string" ||
+    !/^qr_[A-Za-z0-9]+$/.test(qrId)
+  ) {
+    return sendJson(res, 502, {
+      success: false,
+      error: "Razorpay returned invalid QR ID",
+    });
+  }
+
+  let upiUrl = qr.image_content || "";
+
+  if (!upiUrl.startsWith("upi://pay")) {
+    for (let i = 0; i < 5; i++) {
+      await new Promise((resolve) =>
+        setTimeout(resolve, 1200)
       );
 
-      console.log("Razorpay CREATE HTTP:", createResult.response.status);
-
-      if (!createResult.response.ok) {
-        return sendJson(res, createResult.response.status, {
-          success: false,
-          error:
-            createResult.data?.error?.description ||
-            createResult.data?.raw ||
-            "Razorpay QR creation failed",
-        });
-      }
-
-      const qr = createResult.data;
-      const qrId = qr?.id;
-
-      if (!qrId) {
-        return sendJson(res, 500, {
-          success: false,
-          error: "Razorpay QR ID missing",
-        });
-      }
-
-      console.log("QR CREATED:", qrId);
-
-      let upiUrl = qr?.image_content || "";
-
-      if (!upiUrl.startsWith("upi://pay")) {
-        for (let attempt = 1; attempt <= 5; attempt++) {
-          console.log(`QR FETCH attempt ${attempt}/5`);
-          await sleep(1500);
-
-          const fetchResult = await razorpayRequest(
-            `/v1/payments/qr_codes/${encodeURIComponent(qrId)}`,
-            "GET"
-          );
-
-          if (
-            fetchResult.response.ok &&
-            fetchResult.data?.image_content?.startsWith("upi://pay")
-          ) {
-            upiUrl = fetchResult.data.image_content;
-            break;
-          }
-        }
-      }
-
-      if (!upiUrl.startsWith("upi://pay")) {
-        return sendJson(res, 500, {
-          success: false,
-          error: "QR was created but direct UPI payload was not available",
-          qr_id: qrId,
-          image_url: qr?.image_url || null,
-        });
-      }
-
-      return sendJson(res, 200, {
-        success: true,
-        amount: PAYMENT_AMOUNT / 100,
-        qr_id: qrId,
-        upi_url: upiUrl,
-        status: qr.status || "active",
-        payment_timer_seconds: PAYMENT_TIMER_SECONDS,
-        razorpay_qr_close_by: qr.close_by || closeBy,
-        reference_id: referenceId,
-      });
-    }
-
-    // CHECK PAYMENT STATUS AND SAVE TO DATABASE
-    if (req.method === "GET" && req.query?.action === "status") {
-      const qrId = req.query.qr_id;
+      const fetched = await razorpayRequest(
+        `/v1/payments/qr_codes/${encodeURIComponent(qrId)}`,
+        "GET"
+      );
 
       if (
-        typeof qrId !== "string" ||
-        !/^qr_[A-Za-z0-9]+$/.test(qrId)
+        fetched.response.ok &&
+        fetched.data?.image_content?.startsWith("upi://pay")
       ) {
-        return sendJson(res, 400, {
-          success: false,
-          error: "A valid qr_id is required",
-        });
+        upiUrl = fetched.data.image_content;
+        break;
       }
+    }
+  }
 
+  if (!upiUrl.startsWith("upi://pay")) {
+    await closeRazorpayQr(qrId);
+
+    return sendJson(res, 502, {
+      success: false,
+      error: "UPI payload unavailable; QR was closed",
+    });
+  }
+
+  // Save the immutable QR amount/version snapshot
+  try {
+    await bridgeRequest("create_session", {
+      method: "POST",
+      body: {
+        qr_id: qrId,
+        device_id: cfg.deviceId,
+        amount_paise: cfg.amountPaise,
+        config_version: cfg.configVersion,
+        expires_at: expiryLocalString(closeBy),
+      },
+    });
+  } catch (error) {
+    await closeRazorpayQr(qrId);
+    console.error("QR session registration failed:", error);
+
+    return sendJson(res, 409, {
+      success: false,
+      error:
+        "QR session registration failed. QR was closed; please retry.",
+    });
+  }
+
+  return sendJson(res, 200, {
+    success: true,
+    amount: cfg.amountPaise / 100,
+    amount_paise: cfg.amountPaise,
+    currency: "INR",
+    config_version: cfg.configVersion,
+    qr_id: qrId,
+    upi_url: upiUrl,
+    status: qr.status || "active",
+    payment_timer_seconds: PAYMENT_TIMER_SECONDS,
+    razorpay_qr_close_by: qr.close_by || closeBy,
+    reference_id: referenceId,
+  });
+}
+
+// Check payment status using this QR's saved amount
+async function checkStatus(res, qrId) {
+  if (
+    typeof qrId !== "string" ||
+    !/^qr_[A-Za-z0-9]+$/.test(qrId)
+  ) {
+    return sendJson(res, 400, {
+      success: false,
+      error: "A valid qr_id is required",
+    });
+  }
+
+  const session = await getQrSession(qrId);
+
+  const result = await razorpayRequest(
+    `/v1/payments/qr_codes/${encodeURIComponent(qrId)}/payments?count=10`,
+    "GET"
+  );
+
+  if (!result.response.ok) {
+    return sendJson(res, result.response.status, {
+      success: false,
+      error:
+        result.data?.error?.description ||
+        "Unable to check QR payment status",
+    });
+  }
+
+  const items = Array.isArray(result.data?.items)
+    ? result.data.items
+    : [];
+
+  const paid = items.find(
+    (payment) =>
+      payment.status === "captured" &&
+      Number(payment.amount) ===
+        session.expected_amount_paise &&
+      (!payment.currency || payment.currency === "INR")
+  );
+
+  if (!paid) {
+    return sendJson(res, 200, {
+      success: true,
+      paid: false,
+      qr_id: qrId,
+      status: "pending",
+    });
+  }
+
+  const saved = await savePaymentToHostinger({
+    qrId,
+    payment: paid,
+    eventId: `status-poll:${qrId}:${paid.id}`,
+  });
+
+  return sendJson(res, saved.saved ? 200 : 502, {
+    success: saved.saved,
+    paid: true,
+    saved: saved.saved,
+    save_error: saved.saved ? undefined : saved.error,
+    qr_id: qrId,
+    payment_id: paid.id,
+    amount: paid.amount,
+    status: paid.status,
+    method: paid.method,
+    created_at: paid.created_at,
+  });
+}
+
+// Recover an existing captured payment
+async function recoverPayment(res, paymentId) {
+  if (
+    typeof paymentId !== "string" ||
+    !/^pay_[A-Za-z0-9]+$/.test(paymentId)
+  ) {
+    return sendJson(res, 400, {
+      success: false,
+      error: "Valid payment_id is required",
+    });
+  }
+
+  const pResult = await razorpayRequest(
+    `/v1/payments/${encodeURIComponent(paymentId)}`,
+    "GET"
+  );
+
+  if (!pResult.response.ok) {
+    return sendJson(res, pResult.response.status, {
+      success: false,
+      error:
+        pResult.data?.error?.description ||
+        "Unable to fetch payment",
+    });
+  }
+
+  const payment = pResult.data;
+
+  if (payment.status !== "captured") {
+    return sendJson(res, 400, {
+      success: false,
+      error: "Payment is not captured",
+      payment_id: payment.id,
+      status: payment.status,
+    });
+  }
+
+  const qResult = await razorpayRequest(
+    `/v1/payments/qr_codes?payment_id=${encodeURIComponent(paymentId)}`,
+    "GET"
+  );
+
+  if (!qResult.response.ok) {
+    return sendJson(res, qResult.response.status, {
+      success: false,
+      error: "Unable to find QR associated with payment",
+    });
+  }
+
+  const qrs = Array.isArray(qResult.data?.items)
+    ? qResult.data.items
+    : [];
+
+  const qrId =
+    payment.qr_code_id ||
+    qrs.find((item) => item?.id)?.id;
+
+  if (!qrId) {
+    return sendJson(res, 404, {
+      success: false,
+      error: "No QR ID associated with payment; nothing saved",
+    });
+  }
+
+  let saved;
+
+  try {
+    saved = await savePaymentToHostinger({
+      qrId,
+      payment,
+      eventId: `manual-recovery:${payment.id}`,
+    });
+  } catch (error) {
+    console.error("Recovery failed:", error);
+
+    saved = {
+      saved: false,
+      error: "Payment session verification or Hostinger save failed",
+    };
+  }
+
+  return sendJson(res, saved.saved ? 200 : 409, {
+    success: saved.saved,
+    paid: true,
+    saved: saved.saved,
+    save_error: saved.saved ? undefined : saved.error,
+    qr_id: qrId,
+    payment_id: payment.id,
+    amount: payment.amount,
+    status: payment.status,
+  });
+}
+
+// Razorpay webhook
+async function webhook(req, res) {
+  const chunks = [];
+
+  for await (const chunk of req) {
+    chunks.push(
+      Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    );
+  }
+
+  const raw = Buffer.concat(chunks);
+  const secret = requiredEnv("RAZORPAY_WEBHOOK_SECRET");
+  const signature = req.headers["x-razorpay-signature"];
+
+  if (typeof signature !== "string") {
+    return sendJson(res, 401, {
+      success: false,
+      error: "Webhook authentication failed",
+    });
+  }
+
+  const expected = crypto
+    .createHmac("sha256", secret)
+    .update(raw)
+    .digest("hex");
+
+  const receivedBuffer = Buffer.from(signature, "utf8");
+  const expectedBuffer = Buffer.from(expected, "utf8");
+
+  if (
+    receivedBuffer.length !== expectedBuffer.length ||
+    !crypto.timingSafeEqual(
+      receivedBuffer,
+      expectedBuffer
+    )
+  ) {
+    return sendJson(res, 401, {
+      success: false,
+      error: "Invalid webhook signature",
+    });
+  }
+
+  let event;
+
+  try {
+    event = JSON.parse(raw.toString("utf8"));
+  } catch {
+    return sendJson(res, 400, {
+      success: false,
+      error: "Invalid webhook JSON",
+    });
+  }
+
+  let qrId = null;
+  let payment = null;
+
+  if (event.event === "payment.captured") {
+    payment = event.payload?.payment?.entity || null;
+    qrId = payment?.qr_code_id || null;
+  } else if (event.event === "qr_code.credited") {
+    const qr = event.payload?.qr_code?.entity;
+
+    qrId =
+      qr?.id ||
+      event.payload?.qr_code?.id ||
+      null;
+
+    if (qrId) {
       const result = await razorpayRequest(
         `/v1/payments/qr_codes/${encodeURIComponent(qrId)}/payments?count=10`,
         "GET"
       );
 
-      console.log("QR PAYMENT STATUS HTTP:", result.response.status);
-
       if (!result.response.ok) {
-        return sendJson(res, result.response.status, {
-          success: false,
-          error:
-            result.data?.error?.description ||
-            result.data?.raw ||
-            "Unable to check QR payment status",
+        return sendJson(res, 502, {
+          received: true,
+          verified: true,
+          error: "Unable to retrieve QR payments",
         });
       }
 
@@ -296,173 +669,125 @@ export default async function handler(req, res) {
         ? result.data.items
         : [];
 
-      const paidPayment = items.find(
-        payment =>
-          payment.status === "captured" &&
-          Number(payment.amount) === PAYMENT_AMOUNT
-      );
+      const session = await getQrSession(qrId);
 
-      if (!paidPayment) {
-        return sendJson(res, 200, {
-          success: true,
-          paid: false,
-          qr_id: qrId,
-          status: "pending",
-        });
-      }
+      payment = items.find(
+        (item) =>
+          item.status === "captured" &&
+          Number(item.amount) ===
+            session.expected_amount_paise &&
+          (!item.currency || item.currency === "INR")
+      ) || null;
+    }
+  } else {
+    return sendJson(res, 200, {
+      received: true,
+      verified: true,
+      ignored: true,
+    });
+  }
 
-      let saveResult;
+  if (!qrId || !payment) {
+    return sendJson(res, 200, {
+      received: true,
+      verified: true,
+      forwarded: false,
+      reason: "No matching captured payment or QR session",
+    });
+  }
 
-      try {
-        saveResult = await savePaymentToHostinger({
-          qrId,
-          payment: paidPayment,
-          eventId: `status-poll:${qrId}:${paidPayment.id}`,
-        });
-      } catch (error) {
-        console.error("[DEBUG] Hostinger save request failed:", error);
-        saveResult = {
-          saved: false,
-          error: "Hostinger save request failed",
-        };
-      }
+  try {
+    const saved = await savePaymentToHostinger({
+      qrId,
+      payment,
+      eventId: event.id || "",
+    });
 
-      return sendJson(res, 200, {
-        success: true,
-        paid: true,
-        saved: saveResult.saved,
-        save_error: saveResult.saved ? undefined : saveResult.error,
-        qr_id: qrId,
-        payment_id: paidPayment.id,
-        amount: paidPayment.amount,
-        status: paidPayment.status,
-        method: paidPayment.method,
-        created_at: paidPayment.created_at,
+    if (!saved.saved) {
+      return sendJson(res, 502, {
+        received: true,
+        verified: true,
+        forwarded: false,
+        error: saved.error,
       });
     }
 
-    // RECOVER OLD CAPTURED PAYMENT
+    return sendJson(res, 200, {
+      received: true,
+      verified: true,
+      forwarded: true,
+      saved: true,
+    });
+  } catch (error) {
+    console.error("Webhook Hostinger save failed:", error);
+
+    return sendJson(res, 502, {
+      received: true,
+      verified: true,
+      forwarded: false,
+      error: "Hostinger payment save failed",
+    });
+  }
+}
+
+// Main Vercel handler
+export default async function handler(req, res) {
+  try {
+    if (req.method === "OPTIONS") {
+      res.statusCode = 204;
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader(
+        "Access-Control-Allow-Methods",
+        "GET, POST, OPTIONS"
+      );
+      res.setHeader(
+        "Access-Control-Allow-Headers",
+        "Content-Type, X-Helmi-Action"
+      );
+      return res.end();
+    }
+
+    // Health check
+    if (req.method === "GET" && !req.query?.action) {
+      return sendJson(res, 200, {
+        status: "online",
+        service: "HELMI FRESH UPI QR Payment Server",
+      });
+    }
+
+    // Create QR
+    if (
+      req.method === "POST" &&
+      req.headers["x-helmi-action"] === "create-payment"
+    ) {
+      return await createPayment(res);
+    }
+
+    // Check QR payment
+    if (
+      req.method === "GET" &&
+      req.query?.action === "status"
+    ) {
+      return await checkStatus(res, req.query.qr_id);
+    }
+
+    // Recover payment
     if (
       req.method === "GET" &&
       req.query?.action === "recover-payment"
     ) {
-      const paymentId = req.query.payment_id;
-
-      if (
-        typeof paymentId !== "string" ||
-        !/^pay_[A-Za-z0-9]+$/.test(paymentId)
-      ) {
-        return sendJson(res, 400, {
-          success: false,
-          error: "Valid payment_id is required",
-        });
-      }
-
-      // Fetch payment details directly from Razorpay.
-      const paymentResult = await razorpayRequest(
-        `/v1/payments/${encodeURIComponent(paymentId)}`,
-        "GET"
+      return await recoverPayment(
+        res,
+        req.query.payment_id
       );
-
-      if (!paymentResult.response.ok) {
-        return sendJson(res, paymentResult.response.status, {
-          success: false,
-          step: "fetch_payment",
-          error:
-            paymentResult.data?.error?.description ||
-            paymentResult.data?.raw ||
-            "Unable to fetch payment from Razorpay",
-        });
-      }
-
-      const payment = paymentResult.data;
-
-      // Only accept a captured payment of the expected amount.
-      if (
-        payment.status !== "captured" ||
-        Number(payment.amount) !== PAYMENT_AMOUNT
-      ) {
-        return sendJson(res, 400, {
-          success: false,
-          error: "Payment is not a captured ₹5 payment",
-          payment_id: payment.id,
-          status: payment.status,
-          amount: payment.amount,
-        });
-      }
-
-      // Try to find the QR associated with the payment.
-      const qrResult = await razorpayRequest(
-        `/v1/payments/qr_codes?payment_id=${encodeURIComponent(paymentId)}`,
-        "GET"
-      );
-
-      if (!qrResult.response.ok) {
-        return sendJson(res, qrResult.response.status, {
-          success: false,
-          step: "find_qr",
-          error:
-            qrResult.data?.error?.description ||
-            qrResult.data?.raw ||
-            "Unable to find QR code for this payment",
-        });
-      }
-
-      const qrItems = Array.isArray(qrResult.data?.items)
-        ? qrResult.data.items
-        : [];
-
-      const qrId =
-        payment.qr_code_id ||
-        qrItems.find(item => item?.id)?.id ||
-        null;
-
-      if (!qrId) {
-        return sendJson(res, 404, {
-          success: false,
-          step: "find_qr",
-          error:
-            "Payment is captured, but Razorpay did not return an associated QR ID. Nothing was saved.",
-          payment_id: payment.id,
-          status: payment.status,
-          amount: payment.amount,
-        });
-      }
-
-      let saveResult;
-
-      try {
-        saveResult = await savePaymentToHostinger({
-          qrId,
-          payment,
-          eventId: `manual-recovery:${payment.id}`,
-        });
-      } catch (error) {
-        console.error("[DEBUG] Recovery save failed:", error);
-        saveResult = {
-          saved: false,
-          error: "Hostinger save request failed",
-        };
-      }
-
-      return sendJson(res, saveResult.saved ? 200 : 502, {
-        success: saveResult.saved,
-        paid: true,
-        saved: saveResult.saved,
-        save_error: saveResult.saved ? undefined : saveResult.error,
-        qr_id: qrId,
-        payment_id: payment.id,
-        amount: payment.amount,
-        status: payment.status,
-      });
     }
 
-    // CLOSE QR PAYMENT
+    // Close QR
     if (
       req.method === "POST" &&
       req.headers["x-helmi-action"] === "cancel-payment"
     ) {
-      const qrId = req.query.qr_id;
+      const qrId = req.query?.qr_id;
 
       if (
         typeof qrId !== "string" ||
@@ -485,7 +810,6 @@ export default async function handler(req, res) {
           success: false,
           error:
             result.data?.error?.description ||
-            result.data?.raw ||
             "QR close failed",
         });
       }
@@ -499,158 +823,9 @@ export default async function handler(req, res) {
       });
     }
 
-    // RAZORPAY WEBHOOK
+    // Razorpay webhook
     if (req.method === "POST") {
-      console.log("[DEBUG] Webhook POST reached");
-
-      const rawBody = await readRawBody(req);
-      const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
-      const signature = req.headers["x-razorpay-signature"];
-
-      if (!webhookSecret || typeof signature !== "string") {
-        return sendJson(res, 401, {
-          success: false,
-          error: "Webhook authentication failed",
-        });
-      }
-
-      const expectedSignature = crypto
-        .createHmac("sha256", webhookSecret)
-        .update(rawBody)
-        .digest("hex");
-
-      const received = Buffer.from(signature, "utf8");
-      const expected = Buffer.from(expectedSignature, "utf8");
-
-      if (
-        received.length !== expected.length ||
-        !crypto.timingSafeEqual(received, expected)
-      ) {
-        console.error("[DEBUG] Invalid webhook signature");
-
-        return sendJson(res, 401, {
-          success: false,
-          error: "Invalid webhook signature",
-        });
-      }
-
-      let event;
-
-      try {
-        event = JSON.parse(rawBody.toString("utf8"));
-      } catch {
-        return sendJson(res, 400, {
-          success: false,
-          error: "Invalid webhook JSON",
-        });
-      }
-
-      console.log("[DEBUG] Verified event:", event.event);
-
-      let qrId = null;
-      let payment = null;
-
-      if (event.event === "payment.captured") {
-        payment = event.payload?.payment?.entity || null;
-        qrId = payment?.qr_code_id || null;
-
-        if (payment?.id && !qrId) {
-          console.log(
-            "[DEBUG] QR ID absent from payment.captured payload; recovery endpoint may be needed"
-          );
-        }
-      } else if (event.event === "qr_code.credited") {
-        const qrEntity = event.payload?.qr_code?.entity;
-
-        qrId = qrEntity?.id || event.payload?.qr_code?.id || null;
-
-        if (qrId) {
-          const qrPaymentsResult = await razorpayRequest(
-            `/v1/payments/qr_codes/${encodeURIComponent(qrId)}/payments?count=10`,
-            "GET"
-          );
-
-          if (!qrPaymentsResult.response.ok) {
-            return sendJson(res, 502, {
-              success: false,
-              error: "Unable to retrieve QR payments",
-            });
-          }
-
-          const items = Array.isArray(qrPaymentsResult.data?.items)
-            ? qrPaymentsResult.data.items
-            : [];
-
-          payment =
-            items.find(
-              item =>
-                item.status === "captured" &&
-                Number(item.amount) === PAYMENT_AMOUNT
-            ) || null;
-        }
-      } else {
-        return sendJson(res, 200, {
-          received: true,
-          verified: true,
-          ignored: true,
-        });
-      }
-
-      if (
-        !payment ||
-        payment.status !== "captured" ||
-        Number(payment.amount) !== PAYMENT_AMOUNT
-      ) {
-        return sendJson(res, 200, {
-          received: true,
-          verified: true,
-          forwarded: false,
-          reason: "Captured ₹5 payment not found",
-        });
-      }
-
-      if (!qrId) {
-        return sendJson(res, 200, {
-          received: true,
-          verified: true,
-          forwarded: false,
-          reason: "QR ID missing; use the recovery endpoint if needed",
-          payment_id: payment.id,
-        });
-      }
-
-      try {
-        const saveResult = await savePaymentToHostinger({
-          qrId,
-          payment,
-          eventId: event.id || "",
-        });
-
-        if (!saveResult.saved) {
-          return sendJson(res, 502, {
-            received: true,
-            verified: true,
-            forwarded: false,
-            error: saveResult.error,
-          });
-        }
-
-        return sendJson(res, 200, {
-          received: true,
-          verified: true,
-          forwarded: true,
-          saved: true,
-        });
-      } catch (error) {
-        console.error("[DEBUG] Hostinger forwarding failed:", error);
-
-        return sendJson(res, 502, {
-          received: true,
-          verified: true,
-          forwarded: false,
-          error: "Hostinger payment save request failed",
-        });
-      }
+      return await webhook(req, res);
     }
 
     return sendJson(res, 405, {
@@ -662,7 +837,7 @@ export default async function handler(req, res) {
 
     return sendJson(res, 500, {
       success: false,
-      error: error?.message || "Internal server error",
+      error: "Internal server error",
     });
   }
 }
