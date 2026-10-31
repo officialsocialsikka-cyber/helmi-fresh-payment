@@ -34,14 +34,25 @@ function requiredEnv(name) {
   return value;
 }
 
-function razorpayAuth() {
+async function razorpayAuth() {
+  // Prefer credentials saved in the private Hostinger Admin Settings file.
+  // Vercel environment variables remain a temporary fallback until Admin
+  // credentials have been saved; secrets stay server-to-server only.
+  try {
+    const result = await bridgeRequest("credentials");
+    const keyId = result.credentials?.key_id;
+    const keySecret = result.credentials?.key_secret;
+    if (typeof keyId === "string" && keyId &&
+        typeof keySecret === "string" && keySecret) {
+      return "Basic " + Buffer.from(`${keyId}:${keySecret}`).toString("base64");
+    }
+  } catch (error) {
+    console.warn("Admin Razorpay credentials unavailable; using Vercel fallback.");
+  }
+
   const keyId = requiredEnv("RAZORPAY_KEY_ID");
   const keySecret = requiredEnv("RAZORPAY_KEY_SECRET");
-
-  return (
-    "Basic " +
-    Buffer.from(`${keyId}:${keySecret}`).toString("base64")
-  );
+  return "Basic " + Buffer.from(`${keyId}:${keySecret}`).toString("base64");
 }
 
 async function fetchTimeout(url, options = {}, timeoutMs = 7000) {
@@ -62,7 +73,7 @@ async function razorpayRequest(path, method = "GET", body = null) {
   const options = {
     method,
     headers: {
-      Authorization: razorpayAuth(),
+      Authorization: await razorpayAuth(),
       "Content-Type": "application/json",
     },
   };
