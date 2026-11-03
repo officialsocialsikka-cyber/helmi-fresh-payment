@@ -227,6 +227,21 @@ async function getQrSession(qrId) {
   };
 }
 
+
+function paymentOccurredBeforeExpiry(payment, session) {
+  const createdAt = Number(payment?.created_at);
+  if (!Number.isSafeInteger(createdAt) || createdAt <= 0) return false;
+
+  // Hostinger stores expires_at as an Asia/Kolkata wall-clock string.
+  const value = String(session?.expires_at || "");
+  const match = value.match(/^(\\d{4})-(\\d{2})-(\\d{2}) (\\d{2}):(\\d{2}):(\\d{2})$/);
+  if (!match) return false;
+
+  const [, y, mo, d, h, mi, s] = match.map((v, i) => i === 0 ? v : v);
+  const expiryEpoch = Math.floor(Date.UTC(+y, +mo - 1, +d, +h, +mi, +s) / 1000) - 330 * 60;
+  return createdAt <= expiryEpoch;
+}
+
 // Save only a captured payment matching the QR session
 async function savePaymentToHostinger({
   qrId,
@@ -257,6 +272,14 @@ async function savePaymentToHostinger({
     };
   }
 
+  if (!paymentOccurredBeforeExpiry(payment, session)) {
+    return {
+      saved: false,
+      expired: true,
+      error: "Payment was captured after QR session expiry",
+    };
+  }
+
   const eventSecret = requiredEnv("HELMI_EVENT_SECRET");
 
   const response = await fetchTimeout(
@@ -272,6 +295,7 @@ async function savePaymentToHostinger({
         payment_id: payment.id,
         amount: Number(payment.amount),
         status: payment.status,
+        payment_created_at: Number(payment.created_at),
         event_id:
           eventId || `status-poll:${qrId}:${payment.id}`,
       }),
@@ -316,8 +340,9 @@ async function closeRazorpayQr(qrId) {
 async function createPayment(res) {
   const cfg = await getCurrentConfig();
 
-  const closeBy =
-    Math.floor(Date.now() / 1000) + QR_CLOSE_BY_SECONDS;
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const closeBy = nowSeconds + QR_CLOSE_BY_SECONDS;
+  const sessionExpiresAt = nowSeconds + PAYMENT_TIMER_SECONDS;
 
   const referenceId = `HELMI-${Date.now()}`;
 
@@ -404,7 +429,7 @@ async function createPayment(res) {
         device_id: cfg.deviceId,
         amount_paise: cfg.amountPaise,
         config_version: cfg.configVersion,
-        expires_at: expiryLocalString(closeBy),
+        expires_at: expiryLocalString(sessionExpiresAt),
       },
     });
   } catch (error) {
@@ -428,6 +453,7 @@ async function createPayment(res) {
     upi_url: upiUrl,
     status: qr.status || "active",
     payment_timer_seconds: PAYMENT_TIMER_SECONDS,
+    expires_at: sessionExpiresAt,
     razorpay_qr_close_by: qr.close_by || closeBy,
     reference_id: referenceId,
   });
@@ -474,11 +500,29 @@ async function checkStatus(res, qrId) {
   );
 
   if (!paid) {
+    const expired = session.expires_at
+      ? Date.now() >= (Date.parse(session.expires_at.replace(" ", "T") + "+05:30"))
+      : false;
+    if (expired) await closeRazorpayQr(qrId);
     return sendJson(res, 200, {
       success: true,
       paid: false,
+      expired,
       qr_id: qrId,
-      status: "pending",
+      status: expired ? "expired" : "pending",
+    });
+  }
+
+  if (!paymentOccurredBeforeExpiry(paid, session)) {
+    await closeRazorpayQr(qrId);
+    return sendJson(res, 200, {
+      success: true,
+      paid: false,
+      expired: true,
+      qr_id: qrId,
+      status: "expired",
+      late_payment: true,
+      payment_id: paid.id,
     });
   }
 
