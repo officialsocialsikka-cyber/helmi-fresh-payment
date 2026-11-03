@@ -1,4 +1,3 @@
-
 import crypto from "crypto";
 
 export const config = {
@@ -35,19 +34,23 @@ function requiredEnv(name) {
 }
 
 async function razorpayAuth() {
-  // Prefer credentials saved in the private Hostinger Admin Settings file.
-  // Vercel environment variables remain a temporary fallback until Admin
-  // credentials have been saved; secrets stay server-to-server only.
   try {
     const result = await bridgeRequest("credentials");
     const keyId = result.credentials?.key_id;
     const keySecret = result.credentials?.key_secret;
-    if (typeof keyId === "string" && keyId &&
-        typeof keySecret === "string" && keySecret) {
+
+    if (
+      typeof keyId === "string" &&
+      keyId &&
+      typeof keySecret === "string" &&
+      keySecret
+    ) {
       return "Basic " + Buffer.from(`${keyId}:${keySecret}`).toString("base64");
     }
   } catch (error) {
-    console.warn("Admin Razorpay credentials unavailable; using Vercel fallback.");
+    console.warn(
+      "Admin Razorpay credentials unavailable; using Vercel fallback."
+    );
   }
 
   const keyId = requiredEnv("RAZORPAY_KEY_ID");
@@ -100,7 +103,6 @@ async function razorpayRequest(path, method = "GET", body = null) {
   return { response, data };
 }
 
-// Hostinger server-to-server bridge
 async function bridgeRequest(
   action,
   { method = "GET", query = {}, body = null } = {}
@@ -125,9 +127,7 @@ async function bridgeRequest(
         "X-Helmi-Config-Secret": secret,
         "Content-Type": "application/json",
       },
-      ...(body
-        ? { body: JSON.stringify({ action, ...body }) }
-        : {}),
+      ...(body ? { body: JSON.stringify({ action, ...body }) } : {}),
     },
     HOSTINGER_TIMEOUT_MS
   );
@@ -150,7 +150,6 @@ async function bridgeRequest(
   return data;
 }
 
-// Read the current amount from Admin Panel
 async function getCurrentConfig() {
   const result = await bridgeRequest("config", {
     query: {
@@ -197,7 +196,6 @@ function expiryLocalString(unixSeconds) {
   );
 }
 
-// Read immutable amount saved for a QR
 async function getQrSession(qrId) {
   const result = await bridgeRequest("session", {
     query: {
@@ -211,9 +209,7 @@ async function getQrSession(qrId) {
     !session ||
     session.qr_id !== qrId ||
     session.currency !== "INR" ||
-    !Number.isSafeInteger(
-      Number(session.expected_amount_paise)
-    ) ||
+    !Number.isSafeInteger(Number(session.expected_amount_paise)) ||
     Number(session.expected_amount_paise) <= 0
   ) {
     throw new Error("QR session data is invalid");
@@ -221,12 +217,9 @@ async function getQrSession(qrId) {
 
   return {
     ...session,
-    expected_amount_paise: Number(
-      session.expected_amount_paise
-    ),
+    expected_amount_paise: Number(session.expected_amount_paise),
   };
 }
-
 
 function paymentOccurredBeforeExpiry(payment, session) {
   const createdAt = Number(payment?.created_at);
@@ -234,25 +227,28 @@ function paymentOccurredBeforeExpiry(payment, session) {
 
   // Hostinger stores expires_at as an Asia/Kolkata wall-clock string.
   const value = String(session?.expires_at || "");
-  const match = value.match(/^(\\d{4})-(\\d{2})-(\\d{2}) (\\d{2}):(\\d{2}):(\\d{2})$/);
+
+  // FIXED: use \d, not \\d, to match date/time digits.
+  const match = value.match(
+    /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/
+  );
+
   if (!match) return false;
 
-  const [, y, mo, d, h, mi, s] = match.map((v, i) => i === 0 ? v : v);
-  const expiryEpoch = Math.floor(Date.UTC(+y, +mo - 1, +d, +h, +mi, +s) / 1000) - 330 * 60;
+  const [, y, mo, d, h, mi, s] = match;
+  const expiryEpoch =
+    Math.floor(Date.UTC(+y, +mo - 1, +d, +h, +mi, +s) / 1000) -
+    330 * 60;
+
   return createdAt <= expiryEpoch;
 }
 
-// Save only a captured payment matching the QR session
 async function savePaymentToHostinger({
   qrId,
   payment,
   eventId = "",
 }) {
-  if (
-    !qrId ||
-    !payment?.id ||
-    payment.status !== "captured"
-  ) {
+  if (!qrId || !payment?.id || payment.status !== "captured") {
     return {
       saved: false,
       error: "Payment is not captured",
@@ -262,8 +258,7 @@ async function savePaymentToHostinger({
   const session = await getQrSession(qrId);
 
   if (
-    Number(payment.amount) !==
-      session.expected_amount_paise ||
+    Number(payment.amount) !== session.expected_amount_paise ||
     (payment.currency && payment.currency !== "INR")
   ) {
     return {
@@ -296,8 +291,7 @@ async function savePaymentToHostinger({
         amount: Number(payment.amount),
         status: payment.status,
         payment_created_at: Number(payment.created_at),
-        event_id:
-          eventId || `status-poll:${qrId}:${payment.id}`,
+        event_id: eventId || `status-poll:${qrId}:${payment.id}`,
       }),
     },
     HOSTINGER_TIMEOUT_MS
@@ -336,7 +330,6 @@ async function closeRazorpayQr(qrId) {
   }
 }
 
-// Create QR using Admin Panel amount
 async function createPayment(res) {
   const cfg = await getCurrentConfig();
 
@@ -392,9 +385,7 @@ async function createPayment(res) {
 
   if (!upiUrl.startsWith("upi://pay")) {
     for (let i = 0; i < 5; i++) {
-      await new Promise((resolve) =>
-        setTimeout(resolve, 1200)
-      );
+      await new Promise((resolve) => setTimeout(resolve, 1200));
 
       const fetched = await razorpayRequest(
         `/v1/payments/qr_codes/${encodeURIComponent(qrId)}`,
@@ -420,7 +411,6 @@ async function createPayment(res) {
     });
   }
 
-  // Save the immutable QR amount/version snapshot
   try {
     await bridgeRequest("create_session", {
       method: "POST",
@@ -459,7 +449,6 @@ async function createPayment(res) {
   });
 }
 
-// Check payment status using this QR's saved amount
 async function checkStatus(res, qrId) {
   if (
     typeof qrId !== "string" ||
@@ -494,16 +483,18 @@ async function checkStatus(res, qrId) {
   const paid = items.find(
     (payment) =>
       payment.status === "captured" &&
-      Number(payment.amount) ===
-        session.expected_amount_paise &&
+      Number(payment.amount) === session.expected_amount_paise &&
       (!payment.currency || payment.currency === "INR")
   );
 
   if (!paid) {
     const expired = session.expires_at
-      ? Date.now() >= (Date.parse(session.expires_at.replace(" ", "T") + "+05:30"))
+      ? Date.now() >=
+        Date.parse(session.expires_at.replace(" ", "T") + "+05:30")
       : false;
+
     if (expired) await closeRazorpayQr(qrId);
+
     return sendJson(res, 200, {
       success: true,
       paid: false,
@@ -515,6 +506,7 @@ async function checkStatus(res, qrId) {
 
   if (!paymentOccurredBeforeExpiry(paid, session)) {
     await closeRazorpayQr(qrId);
+
     return sendJson(res, 200, {
       success: true,
       paid: false,
@@ -546,7 +538,6 @@ async function checkStatus(res, qrId) {
   });
 }
 
-// Recover an existing captured payment
 async function recoverPayment(res, paymentId) {
   if (
     typeof paymentId !== "string" ||
@@ -639,7 +630,6 @@ async function recoverPayment(res, paymentId) {
   });
 }
 
-// Razorpay webhook
 async function webhook(req, res) {
   const chunks = [];
 
@@ -670,10 +660,7 @@ async function webhook(req, res) {
 
   if (
     receivedBuffer.length !== expectedBuffer.length ||
-    !crypto.timingSafeEqual(
-      receivedBuffer,
-      expectedBuffer
-    )
+    !crypto.timingSafeEqual(receivedBuffer, expectedBuffer)
   ) {
     return sendJson(res, 401, {
       success: false,
@@ -701,10 +688,7 @@ async function webhook(req, res) {
   } else if (event.event === "qr_code.credited") {
     const qr = event.payload?.qr_code?.entity;
 
-    qrId =
-      qr?.id ||
-      event.payload?.qr_code?.id ||
-      null;
+    qrId = qr?.id || event.payload?.qr_code?.id || null;
 
     if (qrId) {
       const result = await razorpayRequest(
@@ -726,13 +710,13 @@ async function webhook(req, res) {
 
       const session = await getQrSession(qrId);
 
-      payment = items.find(
-        (item) =>
-          item.status === "captured" &&
-          Number(item.amount) ===
-            session.expected_amount_paise &&
-          (!item.currency || item.currency === "INR")
-      ) || null;
+      payment =
+        items.find(
+          (item) =>
+            item.status === "captured" &&
+            Number(item.amount) === session.expected_amount_paise &&
+            (!item.currency || item.currency === "INR")
+        ) || null;
     }
   } else {
     return sendJson(res, 200, {
@@ -785,7 +769,6 @@ async function webhook(req, res) {
   }
 }
 
-// Main Vercel handler
 export default async function handler(req, res) {
   try {
     if (req.method === "OPTIONS") {
@@ -802,7 +785,6 @@ export default async function handler(req, res) {
       return res.end();
     }
 
-    // Health check
     if (req.method === "GET" && !req.query?.action) {
       return sendJson(res, 200, {
         status: "online",
@@ -810,7 +792,6 @@ export default async function handler(req, res) {
       });
     }
 
-    // Create QR
     if (
       req.method === "POST" &&
       req.headers["x-helmi-action"] === "create-payment"
@@ -818,7 +799,6 @@ export default async function handler(req, res) {
       return await createPayment(res);
     }
 
-    // Check QR payment
     if (
       req.method === "GET" &&
       req.query?.action === "status"
@@ -826,18 +806,13 @@ export default async function handler(req, res) {
       return await checkStatus(res, req.query.qr_id);
     }
 
-    // Recover payment
     if (
       req.method === "GET" &&
       req.query?.action === "recover-payment"
     ) {
-      return await recoverPayment(
-        res,
-        req.query.payment_id
-      );
+      return await recoverPayment(res, req.query.payment_id);
     }
 
-    // Close QR
     if (
       req.method === "POST" &&
       req.headers["x-helmi-action"] === "cancel-payment"
@@ -878,7 +853,6 @@ export default async function handler(req, res) {
       });
     }
 
-    // Razorpay webhook
     if (req.method === "POST") {
       return await webhook(req, res);
     }
