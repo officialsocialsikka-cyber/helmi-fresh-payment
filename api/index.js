@@ -8,6 +8,7 @@ export const config = {
 
 const DEVICE_ID = process.env.HELMI_DEVICE_ID || "HF-WROOM-01";
 const PAYMENT_TIMER_SECONDS = 120;
+const PAYMENT_GRACE_SECONDS = 60;
 const QR_CLOSE_BY_SECONDS = 960;
 const RAZORPAY_TIMEOUT_MS = 7000;
 const HOSTINGER_TIMEOUT_MS = 5000;
@@ -27,9 +28,7 @@ function sendJson(res, status, data) {
 
 function requiredEnv(name) {
   const value = process.env[name];
-  if (!value) {
-    throw new Error(`${name} is not configured`);
-  }
+  if (!value) throw new Error(`${name} is not configured`);
   return value;
 }
 
@@ -47,7 +46,7 @@ async function razorpayAuth() {
     ) {
       return "Basic " + Buffer.from(`${keyId}:${keySecret}`).toString("base64");
     }
-  } catch (error) {
+  } catch {
     console.warn(
       "Admin Razorpay credentials unavailable; using Vercel fallback."
     );
@@ -81,9 +80,7 @@ async function razorpayRequest(path, method = "GET", body = null) {
     },
   };
 
-  if (body !== null) {
-    options.body = JSON.stringify(body);
-  }
+  if (body !== null) options.body = JSON.stringify(body);
 
   const response = await fetchTimeout(
     `https://api.razorpay.com${path}`,
@@ -196,6 +193,42 @@ function expiryLocalString(unixSeconds) {
   );
 }
 
+function expiryEpochFromSession(session) {
+  const value = String(session?.expires_at || "");
+  const match = value.match(
+    /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/
+  );
+
+  if (!match) return null;
+
+  const [, y, mo, d, h, mi, s] = match;
+
+  return (
+    Math.floor(Date.UTC(+y, +mo - 1, +d, +h, +mi, +s) / 1000) -
+    330 * 60
+  );
+}
+
+function paymentOccurredBeforeExpiry(payment, session) {
+  const createdAt = Number(payment?.created_at);
+  if (!Number.isSafeInteger(createdAt) || createdAt <= 0) return false;
+
+  const expiryEpoch = expiryEpochFromSession(session);
+  if (!Number.isSafeInteger(expiryEpoch)) return false;
+
+  return createdAt <= expiryEpoch + PAYMENT_GRACE_SECONDS;
+}
+
+function sessionGraceExpired(session) {
+  const expiryEpoch = expiryEpochFromSession(session);
+  if (!Number.isSafeInteger(expiryEpoch)) return true;
+
+  return (
+    Math.floor(Date.now() / 1000) >=
+    expiryEpoch + PAYMENT_GRACE_SECONDS
+  );
+}
+
 async function getQrSession(qrId) {
   const result = await bridgeRequest("session", {
     query: {
@@ -219,28 +252,6 @@ async function getQrSession(qrId) {
     ...session,
     expected_amount_paise: Number(session.expected_amount_paise),
   };
-}
-
-function paymentOccurredBeforeExpiry(payment, session) {
-  const createdAt = Number(payment?.created_at);
-  if (!Number.isSafeInteger(createdAt) || createdAt <= 0) return false;
-
-  // Hostinger stores expires_at as an Asia/Kolkata wall-clock string.
-  const value = String(session?.expires_at || "");
-
-  // FIXED: use \d, not \\d, to match date/time digits.
-  const match = value.match(
-    /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/
-  );
-
-  if (!match) return false;
-
-  const [, y, mo, d, h, mi, s] = match;
-  const expiryEpoch =
-    Math.floor(Date.UTC(+y, +mo - 1, +d, +h, +mi, +s) / 1000) -
-    330 * 60;
-
-  return createdAt <= expiryEpoch;
 }
 
 async function savePaymentToHostinger({
@@ -271,7 +282,7 @@ async function savePaymentToHostinger({
     return {
       saved: false,
       expired: true,
-      error: "Payment was captured after QR session expiry",
+      error: "Payment was captured after QR expiry grace period",
     };
   }
 
@@ -488,10 +499,7 @@ async function checkStatus(res, qrId) {
   );
 
   if (!paid) {
-    const expired = session.expires_at
-      ? Date.now() >=
-        Date.parse(session.expires_at.replace(" ", "T") + "+05:30")
-      : false;
+    const expired = sessionGraceExpired(session);
 
     if (expired) await closeRazorpayQr(qrId);
 
