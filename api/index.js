@@ -254,6 +254,15 @@ async function getQrSession(qrId) {
   };
 }
 
+function extractBankRrn(payment) {
+  const raw =
+    payment?.acquirer_data?.rrn ||
+    payment?.acquirer_data?.upi_transaction_id ||
+    "";
+  const value = String(raw).trim();
+  return /^[A-Za-z0-9._-]{1,64}$/.test(value) ? value : "";
+}
+
 async function savePaymentToHostinger({
   qrId,
   payment,
@@ -302,6 +311,7 @@ async function savePaymentToHostinger({
         amount: Number(payment.amount),
         status: payment.status,
         payment_created_at: Number(payment.created_at),
+        bank_rrn: extractBankRrn(payment),
         event_id: eventId || `status-poll:${qrId}:${payment.id}`,
       }),
     },
