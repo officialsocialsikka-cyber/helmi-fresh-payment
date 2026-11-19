@@ -20,7 +20,7 @@ function sendJson(res, status, data) {
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader(
     "Access-Control-Allow-Headers",
-    "Content-Type, X-Helmi-Action"
+    "Content-Type, X-Helmi-Action, X-Helmi-Human-Token"
   );
   res.setHeader("Cache-Control", "no-store, max-age=0");
   return res.end(JSON.stringify(data));
@@ -822,6 +822,74 @@ async function webhook(req, res) {
   }
 }
 
+
+async function readImageBody(req, maxBytes = 4 * 1024 * 1024) {
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of req) {
+    total += chunk.length;
+    if (total > maxBytes) throw new Error("Image too large");
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+function tokenMatches(provided, expected) {
+  if (typeof provided !== "string" || typeof expected !== "string") return false;
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+async function humanDetect(req, res) {
+  const expectedToken = requiredEnv("HELMI_HUMAN_DETECT_TOKEN");
+  const providedToken = req.headers["x-helmi-human-token"];
+  if (!tokenMatches(providedToken, expectedToken)) {
+    return sendJson(res, 401, { success: false, result: "UNAUTHORIZED" });
+  }
+  const contentType = String(req.headers["content-type"] || "").toLowerCase();
+  if (!contentType.startsWith("image/jpeg")) {
+    return sendJson(res, 415, { success: false, error: "Send JPEG image bytes with Content-Type: image/jpeg" });
+  }
+  let image;
+  try { image = await readImageBody(req); } catch (error) {
+    return sendJson(res, 413, { success: false, error: "Image must be 4 MB or smaller" });
+  }
+  if (!image.length) return sendJson(res, 400, { success: false, error: "Empty image" });
+
+  const apiKey = requiredEnv("OPENAI_API_KEY");
+  const model = process.env.HUMAN_DETECT_MODEL || "gpt-4o-mini";
+  const imageDataUrl = `data:image/jpeg;base64,${image.toString("base64")}`;
+  const prompt = "Classify whether a real human person is visibly present in this image. Ignore pets, animals, shadows, objects, reflections, and motion blur. Return exactly one token: HUMAN if a person is clearly visible; NO_HUMAN if no person is visible; UNCERTAIN if image quality or ambiguity prevents a confident decision. Do not explain.";
+  const response = await fetchTimeout(
+    "https://api.openai.com/v1/responses",
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        input: [{ role: "user", content: [
+          { type: "input_text", text: prompt },
+          { type: "input_image", image_url: imageDataUrl, detail: "low" }
+        ] }]
+      })
+    },
+    20000
+  );
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    console.error("Human detection OpenAI error:", response.status);
+    return sendJson(res, 502, { success: false, error: "AI detection service failed" });
+  }
+  const outputText = (data.output || []).flatMap(item => item.content || [])
+    .filter(item => item.type === "output_text")
+    .map(item => item.text || "").join(" ").trim().toUpperCase();
+  const result = outputText.includes("HUMAN") && !outputText.includes("NO_HUMAN")
+    ? "HUMAN"
+    : outputText.includes("NO_HUMAN") ? "NO_HUMAN" : "UNCERTAIN";
+  return sendJson(res, 200, { success: true, result, model });
+}
+
 export default async function handler(req, res) {
   try {
     if (req.method === "OPTIONS") {
@@ -833,7 +901,7 @@ export default async function handler(req, res) {
       );
       res.setHeader(
         "Access-Control-Allow-Headers",
-        "Content-Type, X-Helmi-Action"
+        "Content-Type, X-Helmi-Action, X-Helmi-Human-Token"
       );
       return res.end();
     }
@@ -904,6 +972,10 @@ export default async function handler(req, res) {
         closed_at: result.data.closed_at,
         close_reason: result.data.close_reason,
       });
+    }
+
+    if (req.method === "POST" && req.headers["x-helmi-action"] === "human-detect") {
+      return await humanDetect(req, res);
     }
 
     if (req.method === "POST") {
