@@ -857,36 +857,38 @@ async function humanDetect(req, res) {
   }
   if (!image.length) return sendJson(res, 400, { success: false, error: "Empty image" });
 
-  const apiKey = requiredEnv("OPENAI_API_KEY");
-  const model = process.env.HUMAN_DETECT_MODEL || "gpt-4o-mini";
-  const imageDataUrl = `data:image/jpeg;base64,${image.toString("base64")}`;
+  const apiKey = requiredEnv("GEMINI_API_KEY");
+  const model = process.env.GEMINI_HUMAN_DETECT_MODEL || "gemini-2.5-flash-lite";
   const prompt = "Classify whether a real human person is visibly present in this image. Ignore pets, animals, shadows, objects, reflections, and motion blur. Return exactly one token: HUMAN if a person is clearly visible; NO_HUMAN if no person is visible; UNCERTAIN if image quality or ambiguity prevents a confident decision. Do not explain.";
   const response = await fetchTimeout(
-    "https://api.openai.com/v1/responses",
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
     {
       method: "POST",
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json" },
       body: JSON.stringify({
-        model,
-        input: [{ role: "user", content: [
-          { type: "input_text", text: prompt },
-          { type: "input_image", image_url: imageDataUrl, detail: "low" }
-        ] }]
+        contents: [{ parts: [
+          { text: prompt },
+          { inlineData: { mimeType: "image/jpeg", data: image.toString("base64") } }
+        ] }],
+        generationConfig: { temperature: 0, maxOutputTokens: 10 }
       })
     },
     20000
   );
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    console.error("Human detection OpenAI error:", response.status);
+    console.error("Human detection Gemini error:", response.status, data?.error?.status || "");
     return sendJson(res, 502, { success: false, error: "AI detection service failed" });
   }
-  const outputText = (data.output || []).flatMap(item => item.content || [])
-    .filter(item => item.type === "output_text")
-    .map(item => item.text || "").join(" ").trim().toUpperCase();
-  const result = outputText.includes("HUMAN") && !outputText.includes("NO_HUMAN")
-    ? "HUMAN"
-    : outputText.includes("NO_HUMAN") ? "NO_HUMAN" : "UNCERTAIN";
+  const outputText = (data.candidates || [])
+    .flatMap(candidate => candidate.content?.parts || [])
+    .map(part => part.text || "")
+    .join(" ").trim().toUpperCase();
+  const result = outputText.includes("NO_HUMAN")
+    ? "NO_HUMAN"
+    : outputText.includes("HUMAN")
+      ? "HUMAN"
+      : "UNCERTAIN";
   return sendJson(res, 200, { success: true, result, model });
 }
 
