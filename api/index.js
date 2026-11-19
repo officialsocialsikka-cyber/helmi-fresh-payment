@@ -1,264 +1,423 @@
-import crypto from "crypto";
+// ============================================================
+// HELMIFRESH HUMAN DETECTION + VERCEL DEFAULT HANDLER
+// APPEND THIS AFTER YOUR ORIGINAL webhook() FUNCTION
+// ============================================================
 
-export const config = {
-  api: {
-    bodyParser: false,
-  },
-};
+const HUMAN_DETECT_MAX_BYTES = 4 * 1024 * 1024;
 
-const DEVICE_ID = process.env.HELMI_DEVICE_ID || "HF-WROOM-01";
-const PAYMENT_TIMER_SECONDS = 120;
-const PAYMENT_GRACE_SECONDS = 30;
-const QR_CLOSE_BY_SECONDS = 960;
-const RAZORPAY_TIMEOUT_MS = 7000;
-const HOSTINGER_TIMEOUT_MS = 5000;
+function secureTokenEqual(provided, expected) {
+  if (typeof provided !== "string" || typeof expected !== "string") {
+    return false;
+  }
 
-function sendJson(res, status, data) {
-  res.status(status);
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, X-Helmi-Action, X-Helmi-Human-Token"
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+
+  return (
+    a.length === b.length &&
+    crypto.timingSafeEqual(a, b)
   );
-  res.setHeader("Cache-Control", "no-store, max-age=0");
-  return res.end(JSON.stringify(data));
 }
 
-function requiredEnv(name) {
-  const value = process.env[name];
-  if (!value) throw new Error(`${name} is not configured`);
-  return value;
-}
+async function readRawBody(req, maxBytes = HUMAN_DETECT_MAX_BYTES) {
+  const chunks = [];
+  let total = 0;
 
-async function razorpayAuth() {
-  try {
-    const result = await bridgeRequest("credentials");
-    const keyId = result.credentials?.key_id;
-    const keySecret = result.credentials?.key_secret;
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk)
+      ? chunk
+      : Buffer.from(chunk);
 
-    if (
-      typeof keyId === "string" &&
-      keyId &&
-      typeof keySecret === "string" &&
-      keySecret
-    ) {
-      return "Basic " + Buffer.from(`${keyId}:${keySecret}`).toString("base64");
+    total += buffer.length;
+
+    if (total > maxBytes) {
+      throw new Error("BODY_TOO_LARGE");
     }
-  } catch {
-    console.warn(
-      "Admin Razorpay credentials unavailable; using Vercel fallback."
-    );
+
+    chunks.push(buffer);
   }
 
-  const keyId = requiredEnv("RAZORPAY_KEY_ID");
-  const keySecret = requiredEnv("RAZORPAY_KEY_SECRET");
-  return "Basic " + Buffer.from(`${keyId}:${keySecret}`).toString("base64");
+  return Buffer.concat(chunks);
 }
 
-async function fetchTimeout(url, options = {}, timeoutMs = 7000) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+// ------------------------------------------------------------
+// GEMINI HUMAN DETECTION
+// ------------------------------------------------------------
 
-  try {
-    return await fetch(url, {
-      ...options,
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function razorpayRequest(path, method = "GET", body = null) {
-  const options = {
-    method,
-    headers: {
-      Authorization: await razorpayAuth(),
-      "Content-Type": "application/json",
-    },
-  };
-
-  if (body !== null) options.body = JSON.stringify(body);
-
-  const response = await fetchTimeout(
-    `https://api.razorpay.com${path}`,
-    options,
-    RAZORPAY_TIMEOUT_MS
+async function humanDetect(req, res) {
+  const expectedToken = requiredEnv(
+    "HELMI_HUMAN_DETECT_TOKEN"
   );
 
-  const raw = await response.text();
-  let data = {};
-
-  try {
-    data = raw ? JSON.parse(raw) : {};
-  } catch {
-    data = { raw };
-  }
-
-  return { response, data };
-}
-
-async function bridgeRequest(
-  action,
-  { method = "GET", query = {}, body = null } = {}
-) {
-  const base = requiredEnv("HELMI_PAYMENT_BRIDGE_URL");
-  const secret = requiredEnv("HELMI_CONFIG_SECRET");
-  const url = new URL(base);
-
-  if (method === "GET") {
-    url.searchParams.set("action", action);
-
-    for (const [key, value] of Object.entries(query)) {
-      url.searchParams.set(key, String(value));
-    }
-  }
-
-  const response = await fetchTimeout(
-    url.toString(),
-    {
-      method,
-      headers: {
-        "X-Helmi-Config-Secret": secret,
-        "Content-Type": "application/json",
-      },
-      ...(body ? { body: JSON.stringify({ action, ...body }) } : {}),
-    },
-    HOSTINGER_TIMEOUT_MS
-  );
-
-  const raw = await response.text();
-  let data;
-
-  try {
-    data = raw ? JSON.parse(raw) : {};
-  } catch {
-    throw new Error("Hostinger bridge returned invalid JSON");
-  }
-
-  if (!response.ok || !data.success) {
-    throw new Error(
-      data.error || `Hostinger bridge HTTP ${response.status}`
-    );
-  }
-
-  return data;
-}
-
-async function getCurrentConfig() {
-  const result = await bridgeRequest("config", {
-    query: {
-      device_id: DEVICE_ID,
-    },
-  });
-
-  const amount = Number(result.payment?.amount_paise);
-  const version = Number(result.config_version);
-
-  if (!Number.isSafeInteger(amount) || amount <= 0) {
-    throw new Error("Admin Panel payment amount is invalid");
-  }
-
-  if (result.payment?.currency !== "INR") {
-    throw new Error("Only INR payments are supported");
-  }
-
-  if (result.payment?.gateway_enabled !== true) {
-    throw new Error("Payment gateway is disabled in Admin Panel");
-  }
-
-  if (!Number.isSafeInteger(version) || version <= 0) {
-    throw new Error("Admin configuration version is invalid");
-  }
-
-  return {
-    amountPaise: amount,
-    configVersion: version,
-    deviceId: result.device_id,
-  };
-}
-
-function expiryLocalString(unixSeconds) {
-  const d = new Date(unixSeconds * 1000 + 330 * 60 * 1000);
-
-  return (
-    `${d.getUTCFullYear()}-` +
-    `${String(d.getUTCMonth() + 1).padStart(2, "0")}-` +
-    `${String(d.getUTCDate()).padStart(2, "0")} ` +
-    `${String(d.getUTCHours()).padStart(2, "0")}:` +
-    `${String(d.getUTCMinutes()).padStart(2, "0")}:` +
-    `${String(d.getUTCSeconds()).padStart(2, "0")}`
-  );
-}
-
-function expiryEpochFromSession(session) {
-  const value = String(session?.expires_at || "");
-  const match = value.match(
-    /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/
-  );
-
-  if (!match) return null;
-
-  const [, y, mo, d, h, mi, s] = match;
-
-  return (
-    Math.floor(Date.UTC(+y, +mo - 1, +d, +h, +mi, +s) / 1000) -
-    330 * 60
-  );
-}
-
-function paymentOccurredBeforeExpiry(payment, session) {
-  const createdAt = Number(payment?.created_at);
-  if (!Number.isSafeInteger(createdAt) || createdAt <= 0) return false;
-
-  const expiryEpoch = expiryEpochFromSession(session);
-  if (!Number.isSafeInteger(expiryEpoch)) return false;
-
-  return createdAt <= expiryEpoch + PAYMENT_GRACE_SECONDS;
-}
-
-function sessionGraceExpired(session) {
-  const expiryEpoch = expiryEpochFromSession(session);
-  if (!Number.isSafeInteger(expiryEpoch)) return true;
-
-  return (
-    Math.floor(Date.now() / 1000) >=
-    expiryEpoch + PAYMENT_GRACE_SECONDS
-  );
-}
-
-async function getQrSession(qrId) {
-  const result = await bridgeRequest("session", {
-    query: {
-      qr_id: qrId,
-    },
-  });
-
-  const session = result.session;
+  const suppliedToken =
+    req.headers["x-helmi-human-token"];
 
   if (
-    !session ||
-    session.qr_id !== qrId ||
-    session.currency !== "INR" ||
-    !Number.isSafeInteger(Number(session.expected_amount_paise)) ||
-    Number(session.expected_amount_paise) <= 0
+    !secureTokenEqual(
+      suppliedToken,
+      expectedToken
+    )
   ) {
-    throw new Error("QR session data is invalid");
+    return sendJson(res, 401, {
+      success: false,
+      result: "UNAUTHORIZED",
+    });
   }
 
-  return {
-    ...session,
-    expected_amount_paise: Number(session.expected_amount_paise),
-  };
+  const contentType = String(
+    req.headers["content-type"] || ""
+  ).toLowerCase();
+
+  if (!contentType.startsWith("image/jpeg")) {
+    return sendJson(res, 415, {
+      success: false,
+      error: "Content-Type must be image/jpeg",
+      result: "UNCERTAIN",
+    });
+  }
+
+  let imageBuffer;
+
+  try {
+    imageBuffer = await readRawBody(
+      req,
+      HUMAN_DETECT_MAX_BYTES
+    );
+  } catch (error) {
+    if (error.message === "BODY_TOO_LARGE") {
+      return sendJson(res, 413, {
+        success: false,
+        error: "JPEG image exceeds 4 MB",
+        result: "UNCERTAIN",
+      });
+    }
+
+    return sendJson(res, 400, {
+      success: false,
+      error: "Unable to read image",
+      result: "UNCERTAIN",
+    });
+  }
+
+  if (!imageBuffer || imageBuffer.length === 0) {
+    return sendJson(res, 400, {
+      success: false,
+      error: "Empty image",
+      result: "UNCERTAIN",
+    });
+  }
+
+  // Basic JPEG validation
+  if (
+    imageBuffer.length < 4 ||
+    imageBuffer[0] !== 0xff ||
+    imageBuffer[1] !== 0xd8
+  ) {
+    return sendJson(res, 400, {
+      success: false,
+      error: "Invalid JPEG image",
+      result: "UNCERTAIN",
+    });
+  }
+
+  const geminiKey = requiredEnv(
+    "GEMINI_API_KEY"
+  );
+
+  const model =
+    process.env.HUMAN_DETECT_MODEL ||
+    "gemini-2.5-flash";
+
+  const prompt = `
+Analyze this camera image for the presence of a real human person.
+
+Classify the image using exactly ONE of these labels:
+
+HUMAN
+NO_HUMAN
+UNCERTAIN
+
+Rules:
+- HUMAN: A real human person is clearly visible in the image.
+- NO_HUMAN: No human person is visible. Pets, animals, helmets,
+  objects, shadows, pictures, posters and reflections are not humans.
+- UNCERTAIN: Image is blurry, obstructed, too dark, ambiguous,
+  incomplete, or confidence is insufficient.
+
+Do not infer a human from a pet or object.
+Do not provide explanations.
+Return only the classification label.
+`;
+
+  const imageBase64 =
+    imageBuffer.toString("base64");
+
+  const geminiUrl =
+    `https://generativelanguage.googleapis.com/v1beta/models/` +
+    `${encodeURIComponent(model)}:generateContent`;
+
+  let geminiResponse;
+
+  try {
+    geminiResponse = await fetchTimeout(
+      geminiUrl,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": geminiKey,
+        },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [
+                {
+                  text: prompt,
+                },
+                {
+                  inline_data: {
+                    mime_type: "image/jpeg",
+                    data: imageBase64,
+                  },
+                },
+              ],
+            },
+          ],
+          generationConfig: {
+            temperature: 0,
+            maxOutputTokens: 10,
+          },
+        }),
+      },
+      GEMINI_TIMEOUT_MS
+    );
+  } catch (error) {
+    console.error(
+      "[HUMAN-DETECT] Gemini request failed:",
+      error.message
+    );
+
+    return sendJson(res, 502, {
+      success: false,
+      result: "UNCERTAIN",
+      error: "AI service unavailable",
+    });
+  }
+
+  let geminiData;
+
+  try {
+    geminiData = await geminiResponse.json();
+  } catch {
+    return sendJson(res, 502, {
+      success: false,
+      result: "UNCERTAIN",
+      error: "Invalid AI response",
+    });
+  }
+
+  if (!geminiResponse.ok) {
+    console.error(
+      "[HUMAN-DETECT] Gemini HTTP error:",
+      geminiResponse.status
+    );
+
+    return sendJson(res, 502, {
+      success: false,
+      result: "UNCERTAIN",
+      error: "Gemini API error",
+    });
+  }
+
+  const outputText =
+    geminiData?.candidates?.[0]?.content?.parts
+      ?.map((part) => part.text || "")
+      .join(" ")
+      .trim()
+      .toUpperCase() || "";
+
+  let result = "UNCERTAIN";
+
+  if (
+    outputText === "HUMAN" ||
+    outputText.includes("HUMAN")
+  ) {
+    result = "HUMAN";
+  } else if (
+    outputText === "NO_HUMAN" ||
+    outputText.includes("NO_HUMAN")
+  ) {
+    result = "NO_HUMAN";
+  }
+
+  // Avoid accepting malformed or conflicting AI output.
+  if (
+    outputText.includes("HUMAN") &&
+    outputText.includes("NO_HUMAN")
+  ) {
+    result = "UNCERTAIN";
+  }
+
+  console.log(
+    `[HUMAN-DETECT] Result=${result} Model=${model}`
+  );
+
+  return sendJson(res, 200, {
+    success: true,
+    result,
+    model,
+  });
 }
 
-function extractBankRrn(payment) {
-  const raw =
-    payment?.acquirer_data?.rrn ||
-    payment?.acquirer_data?.upi_transaction_id ||
-    "";
-  const value = String(raw).trim();
-  return /^[A-Za-z0-9._-]{1,64}$/.test(value) ? value : "";
+// ============================================================
+// VERCEL DEFAULT HANDLER
+// THIS FIXES THE "DEFAULT EXPORT MUST BE A FUNCTION" ERROR
+// ============================================================
+
+export default async function handler(req, res) {
+  try {
+    // CORS preflight
+    if (req.method === "OPTIONS") {
+      res.statusCode = 204;
+
+      res.setHeader(
+        "Access-Control-Allow-Origin",
+        "*"
+      );
+
+      res.setHeader(
+        "Access-Control-Allow-Methods",
+        "GET, POST, OPTIONS"
+      );
+
+      res.setHeader(
+        "Access-Control-Allow-Headers",
+        "Content-Type, X-Helmi-Action, X-Helmi-Human-Token, X-Razorpay-Signature"
+      );
+
+      return res.end();
+    }
+
+    // Health check
+    if (
+      req.method === "GET" &&
+      !req.query?.action
+    ) {
+      return sendJson(res, 200, {
+        success: true,
+        status: "online",
+        service: "HelmiFresh Payment + Human Detection API",
+        payment: "available",
+        human_detection: "available",
+      });
+    }
+
+    const action = String(
+      req.headers["x-helmi-action"] || ""
+    ).toLowerCase();
+
+    // HUMAN DETECTION
+    if (
+      req.method === "POST" &&
+      action === "human-detect"
+    ) {
+      return await humanDetect(req, res);
+    }
+
+    // CREATE PAYMENT QR
+    if (
+      req.method === "POST" &&
+      action === "create-payment"
+    ) {
+      return await createPayment(res);
+    }
+
+    // CANCEL QR
+    if (
+      req.method === "POST" &&
+      action === "cancel-payment"
+    ) {
+      const qrId = req.query?.qr_id;
+
+      if (
+        typeof qrId !== "string" ||
+        !/^qr_[A-Za-z0-9]+$/.test(qrId)
+      ) {
+        return sendJson(res, 400, {
+          success: false,
+          error: "Valid qr_id is required",
+        });
+      }
+
+      const result = await razorpayRequest(
+        `/v1/payments/qr_codes/${encodeURIComponent(qrId)}/close`,
+        "POST",
+        {}
+      );
+
+      if (!result.response.ok) {
+        return sendJson(
+          res,
+          result.response.status,
+          {
+            success: false,
+            error:
+              result.data?.error?.description ||
+              "QR close failed",
+          }
+        );
+      }
+
+      return sendJson(res, 200, {
+        success: true,
+        qr_id: result.data.id,
+        status: result.data.status,
+        closed_at: result.data.closed_at,
+        close_reason: result.data.close_reason,
+      });
+    }
+
+    // PAYMENT STATUS
+    if (
+      req.method === "GET" &&
+      req.query?.action === "status"
+    ) {
+      return await checkStatus(
+        res,
+        req.query?.qr_id
+      );
+    }
+
+    // MANUAL PAYMENT RECOVERY
+    if (
+      req.method === "GET" &&
+      req.query?.action === "recover-payment"
+    ) {
+      return await recoverPayment(
+        res,
+        req.query?.payment_id
+      );
+    }
+
+    // RAZORPAY WEBHOOK
+    // POST without a Helmi action is treated as webhook.
+    if (req.method === "POST") {
+      return await webhook(req, res);
+    }
+
+    return sendJson(res, 405, {
+      success: false,
+      error: "Method not allowed",
+    });
+  } catch (error) {
+    console.error(
+      "[VERCEL HANDLER ERROR]",
+      error
+    );
+
+    return sendJson(res, 500, {
+      success: false,
+      error: "Internal server error",
+    });
+  }
 }
