@@ -858,7 +858,7 @@ async function humanDetect(req, res) {
   if (!image.length) return sendJson(res, 400, { success: false, error: "Empty image" });
 
   const apiKey = requiredEnv("GEMINI_API_KEY");
-  const model = process.env.GEMINI_HUMAN_DETECT_MODEL || "gemini-2.5-flash-lite";
+  const model = process.env.GEMINI_HUMAN_DETECT_MODEL || "gemini-3.5-flash-lite";
   const prompt = "Classify whether a real human person is visibly present in this image. Ignore pets, animals, shadows, objects, reflections, and motion blur. Return exactly one token: HUMAN if a person is clearly visible; NO_HUMAN if no person is visible; UNCERTAIN if image quality or ambiguity prevents a confident decision. Do not explain.";
   const response = await fetchTimeout(
     `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
