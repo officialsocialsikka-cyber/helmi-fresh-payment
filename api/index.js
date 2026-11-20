@@ -859,7 +859,49 @@ async function humanDetect(req, res) {
 
   const apiKey = requiredEnv("GEMINI_API_KEY");
   const model = process.env.GEMINI_HUMAN_DETECT_MODEL || "gemini-3.5-flash-lite";
-  const prompt = "Classify whether a real human person is visibly present in this image. Ignore pets, animals, shadows, objects, reflections, and motion blur. Return exactly one token: HUMAN if a person is clearly visible; NO_HUMAN if no person is visible; UNCERTAIN if image quality or ambiguity prevents a confident decision. Do not explain.";
+  const prompt = `
+You are HelmiFresh Human Presence Detection AI.
+
+Analyze the camera image and determine whether a REAL HUMAN PERSON
+is physically visible anywhere in the image.
+
+Return HUMAN if a real person is visible in ANY of these situations:
+- A person is standing.
+- A person is sitting on a chair, bench, or other surface.
+- A person is bending, leaning, crouching, or lying down.
+- A person is stationary and not moving.
+- A person is facing the camera or facing away from the camera.
+- A person is partially visible.
+- A person's head, face, torso, arms, hands, or legs are visible.
+- A person is wearing a helmet, mask, or dark clothing.
+- A person is visible in the foreground or background.
+- A person is entering or leaving the camera frame.
+- A person is small but recognizable in the image.
+
+IMPORTANT DETECTION RULES:
+- Do NOT require the person to be standing.
+- Do NOT require the person to be moving.
+- Do NOT require the face to be visible.
+- Do NOT classify a seated or stationary person as NO_HUMAN.
+- Check the entire image, including edges and background.
+- If a recognizable real human body or body part is visible, prefer HUMAN.
+
+Return NO_HUMAN only when there is no real human person visible in the image.
+
+Return UNCERTAIN only when the image is too blurry, too dark, corrupted,
+obstructed, or visually ambiguous to make a reliable decision.
+
+Do not confuse animals, mannequins, statues, posters, photographs, shadows,
+reflections, or human-shaped objects with real people.
+
+Return exactly one token:
+HUMAN
+NO_HUMAN
+or
+UNCERTAIN
+
+Do not provide any explanation.
+`;
   const response = await fetchTimeout(
     `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
     {
