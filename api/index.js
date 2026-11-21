@@ -902,41 +902,59 @@ UNCERTAIN
 
 Do not provide any explanation.
 `;
-  // Keep this below the ESP32 response timeout so the camera receives a
-  // controlled JSON error instead of timing out with an empty response.
-  const GEMINI_TIMEOUT_MS = 18000;
+  // Two controlled attempts: keep each Gemini call short so the ESP32/Vercel
+  // request does not wait for one long 18-second stall. Retry only transient
+  // timeout/network failures; do not retry HTTP/API errors.
+  const GEMINI_ATTEMPT_TIMEOUT_MS = 8000;
+  const GEMINI_MAX_ATTEMPTS = 2;
+  const GEMINI_RETRY_DELAY_MS = 500;
   const geminiStartedAt = Date.now();
-  let response;
-  try {
-    response = await fetchTimeout(
-      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
-      {
-        method: "POST",
-        headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [
-            { text: prompt },
-            { inlineData: { mimeType: "image/jpeg", data: image.toString("base64") } }
-          ] }],
-          generationConfig: { temperature: 0, maxOutputTokens: 10 }
-        })
-      },
-      GEMINI_TIMEOUT_MS
-    );
-  } catch (error) {
+  let response = null;
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= GEMINI_MAX_ATTEMPTS; attempt++) {
+    const attemptStartedAt = Date.now();
+    try {
+      response = await fetchTimeout(
+        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+        {
+          method: "POST",
+          headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [
+              { text: prompt },
+              { inlineData: { mimeType: "image/jpeg", data: image.toString("base64") } }
+            ] }],
+            generationConfig: { temperature: 0, maxOutputTokens: 10 }
+          })
+        },
+        GEMINI_ATTEMPT_TIMEOUT_MS
+      );
+      console.log(`Human detection Gemini attempt ${attempt}/${GEMINI_MAX_ATTEMPTS} HTTP ${response.status} in ${Date.now() - attemptStartedAt}ms`);
+      lastError = null;
+      break;
+    } catch (error) {
+      lastError = error;
+      const isTimeout = error?.name === "AbortError";
+      console.error(`Human detection Gemini attempt ${attempt}/${GEMINI_MAX_ATTEMPTS} ${isTimeout ? "TIMEOUT" : "NETWORK ERROR"} after ${Date.now() - attemptStartedAt}ms:`, error?.name || "Error", error?.message || "");
+      if (attempt < GEMINI_MAX_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, GEMINI_RETRY_DELAY_MS));
+      }
+    }
+  }
+
+  if (!response) {
     const elapsedMs = Date.now() - geminiStartedAt;
-    const isTimeout = error?.name === "AbortError";
-    console.error(
-      `Human detection Gemini ${isTimeout ? "TIMEOUT" : "NETWORK ERROR"} after ${elapsedMs}ms:`,
-      error?.name || "Error",
-      error?.message || ""
-    );
+    const isTimeout = lastError?.name === "AbortError";
+    console.error(`Human detection Gemini final failure after ${elapsedMs}ms`);
     return sendJson(res, isTimeout ? 504 : 502, {
       success: false,
       error: isTimeout ? "AI_TIMEOUT" : "AI_NETWORK_ERROR",
+      attempts: GEMINI_MAX_ATTEMPTS,
+      elapsed_ms: elapsedMs,
       message: isTimeout
-        ? "Gemini did not respond within the server timeout. Please retry."
-        : "Unable to reach Gemini AI. Please retry."
+        ? "Gemini timed out on both attempts. Please retry."
+        : "Unable to reach Gemini AI after retry. Please retry."
     });
   }
 
