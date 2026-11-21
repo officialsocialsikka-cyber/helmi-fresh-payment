@@ -12,6 +12,8 @@ const PAYMENT_GRACE_SECONDS = 30;
 const QR_CLOSE_BY_SECONDS = 960;
 const RAZORPAY_TIMEOUT_MS = 7000;
 const HOSTINGER_TIMEOUT_MS = 5000;
+// Warm-instance protection against repeated Gemini quota/rate-limit requests.
+let geminiRateLimitUntilMs = 0;
 
 function sendJson(res, status, data) {
   res.status(status);
@@ -857,6 +859,21 @@ async function humanDetect(req, res) {
   }
   if (!image.length) return sendJson(res, 400, { success: false, error: "Empty image" });
 
+  // If Gemini recently returned 429, stop sending more requests for this warm instance.
+  const cooldownRemainingMs = geminiRateLimitUntilMs - Date.now();
+  if (cooldownRemainingMs > 0) {
+    const cooldownSec = Math.ceil(cooldownRemainingMs / 1000);
+    console.warn(`Human detection blocked by Gemini rate-limit cooldown (${cooldownSec}s remaining)`);
+    res.setHeader("Retry-After", String(cooldownSec));
+    return sendJson(res, 429, {
+      success: false,
+      result: "AI_RATE_LIMITED",
+      error: "GEMINI_RATE_LIMIT_COOLDOWN",
+      cooldown_seconds: cooldownSec,
+      message: "Gemini rate limit cooldown active. Wait before retrying."
+    });
+  }
+
   const apiKey = requiredEnv("GEMINI_API_KEY");
   const model = process.env.GEMINI_HUMAN_DETECT_MODEL || "gemini-3.5-flash-lite";
   const prompt = `
@@ -902,15 +919,14 @@ UNCERTAIN
 
 Do not provide any explanation.
 `;
-  // Two controlled attempts: retry transient HTTP statuses (503/429/etc.),
-  // timeout and network failures. Permanent API errors are not retried.
+  // Two controlled attempts: keep each Gemini call short so the ESP32/Vercel
+  // request does not wait for one long 18-second stall. Retry only transient
+  // timeout/network failures; do not retry HTTP/API errors.
   const GEMINI_ATTEMPT_TIMEOUT_MS = 8000;
-  const GEMINI_MAX_ATTEMPTS = 2;
-  const GEMINI_RETRY_DELAY_MS = 1000;
-  const RETRYABLE_HTTP_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+  const GEMINI_MAX_ATTEMPTS = 3;
+  const GEMINI_RETRY_DELAYS_MS = [1000, 3000];
   const geminiStartedAt = Date.now();
   let response = null;
-  let data = {};
   let lastError = null;
 
   for (let attempt = 1; attempt <= GEMINI_MAX_ATTEMPTS; attempt++) {
@@ -931,20 +947,18 @@ Do not provide any explanation.
         },
         GEMINI_ATTEMPT_TIMEOUT_MS
       );
-      const attemptMs = Date.now() - attemptStartedAt;
-      data = await response.json().catch(() => ({}));
-      console.log(`Human detection Gemini attempt ${attempt}/${GEMINI_MAX_ATTEMPTS} HTTP ${response.status} in ${attemptMs}ms`);
-
-      if (response.ok) {
-        lastError = null;
+      console.log(`Human detection Gemini attempt ${attempt}/${GEMINI_MAX_ATTEMPTS} HTTP ${response.status} in ${Date.now() - attemptStartedAt}ms`);
+      lastError = null;
+      if (response.status === 429) {
+        // Quota/rate limit: do not retry immediately. Block subsequent requests for 60 sec.
+        geminiRateLimitUntilMs = Date.now() + 60000;
+        console.warn("Human detection Gemini HTTP 429: setting 60-second cooldown; no retry");
         break;
       }
-
-      const retryable = RETRYABLE_HTTP_STATUSES.has(response.status);
-      lastError = new Error(`Gemini HTTP ${response.status}: ${data?.error?.message || data?.error?.status || "API error"}`);
-      if (retryable && attempt < GEMINI_MAX_ATTEMPTS) {
-        console.warn(`Human detection Gemini HTTP ${response.status} is transient; retrying after ${GEMINI_RETRY_DELAY_MS}ms (attempt ${attempt + 1}/${GEMINI_MAX_ATTEMPTS})`);
-        await new Promise((resolve) => setTimeout(resolve, GEMINI_RETRY_DELAY_MS));
+      if ([500, 502, 503, 504, 408].includes(response.status) && attempt < GEMINI_MAX_ATTEMPTS) {
+        const delayMs = GEMINI_RETRY_DELAYS_MS[attempt - 1] || 3000;
+        console.warn(`Human detection Gemini HTTP ${response.status} transient; retrying after ${delayMs}ms (attempt ${attempt + 1}/${GEMINI_MAX_ATTEMPTS})`);
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
         response = null;
         continue;
       }
@@ -954,32 +968,53 @@ Do not provide any explanation.
       const isTimeout = error?.name === "AbortError";
       console.error(`Human detection Gemini attempt ${attempt}/${GEMINI_MAX_ATTEMPTS} ${isTimeout ? "TIMEOUT" : "NETWORK ERROR"} after ${Date.now() - attemptStartedAt}ms:`, error?.name || "Error", error?.message || "");
       if (attempt < GEMINI_MAX_ATTEMPTS) {
-        console.warn(`Retrying Gemini after ${GEMINI_RETRY_DELAY_MS}ms (attempt ${attempt + 1}/${GEMINI_MAX_ATTEMPTS})`);
         await new Promise((resolve) => setTimeout(resolve, GEMINI_RETRY_DELAY_MS));
       }
-      response = null;
     }
   }
 
-  const elapsedMs = Date.now() - geminiStartedAt;
-  if (!response || !response.ok) {
-    const status = response?.status || null;
+  if (!response) {
+    const elapsedMs = Date.now() - geminiStartedAt;
     const isTimeout = lastError?.name === "AbortError";
-    console.error(`Human detection Gemini final failure after ${elapsedMs}ms; status=${status || "none"}; attempts=${GEMINI_MAX_ATTEMPTS}`);
+    console.error(`Human detection Gemini final failure after ${elapsedMs}ms`);
     return sendJson(res, isTimeout ? 504 : 502, {
       success: false,
-      error: isTimeout ? "AI_TIMEOUT" : status ? "AI_SERVICE_ERROR" : "AI_NETWORK_ERROR",
-      gemini_status: status,
+      error: isTimeout ? "AI_TIMEOUT" : "AI_NETWORK_ERROR",
       attempts: GEMINI_MAX_ATTEMPTS,
       elapsed_ms: elapsedMs,
-      message: status
-        ? `Gemini service failed after retry (HTTP ${status}). Please retry later.`
-        : isTimeout
-          ? "Gemini timed out on both attempts. Please retry."
-          : "Unable to reach Gemini AI after retry. Please retry."
+      message: isTimeout
+        ? "Gemini timed out on both attempts. Please retry."
+        : "Unable to reach Gemini AI after retry. Please retry."
     });
   }
 
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    console.error(
+      "Human detection Gemini HTTP error:",
+      response.status,
+      data?.error?.status || "",
+      data?.error?.message || ""
+    );
+    if (response.status === 429) {
+      const cooldownSec = Math.max(1, Math.ceil((geminiRateLimitUntilMs - Date.now()) / 1000));
+      res.setHeader("Retry-After", String(cooldownSec));
+      return sendJson(res, 429, {
+        success: false,
+        result: "AI_RATE_LIMITED",
+        error: "GEMINI_RATE_LIMIT",
+        gemini_status: 429,
+        cooldown_seconds: cooldownSec,
+        message: "Gemini quota/rate limit reached. Wait before retrying."
+      });
+    }
+    return sendJson(res, 502, {
+      success: false,
+      result: "AI_SERVICE_ERROR",
+      error: "AI_SERVICE_ERROR",
+      gemini_status: response.status
+    });
+  }
   const outputText = (data.candidates || [])
     .flatMap(candidate => candidate.content?.parts || [])
     .map(part => part.text || "")
