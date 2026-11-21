@@ -902,25 +902,57 @@ UNCERTAIN
 
 Do not provide any explanation.
 `;
-  const response = await fetchTimeout(
-    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
-    {
-      method: "POST",
-      headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [
-          { text: prompt },
-          { inlineData: { mimeType: "image/jpeg", data: image.toString("base64") } }
-        ] }],
-        generationConfig: { temperature: 0, maxOutputTokens: 10 }
-      })
-    },
-    20000
-  );
+  // Keep this below the ESP32 response timeout so the camera receives a
+  // controlled JSON error instead of timing out with an empty response.
+  const GEMINI_TIMEOUT_MS = 18000;
+  const geminiStartedAt = Date.now();
+  let response;
+  try {
+    response = await fetchTimeout(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+      {
+        method: "POST",
+        headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [
+            { text: prompt },
+            { inlineData: { mimeType: "image/jpeg", data: image.toString("base64") } }
+          ] }],
+          generationConfig: { temperature: 0, maxOutputTokens: 10 }
+        })
+      },
+      GEMINI_TIMEOUT_MS
+    );
+  } catch (error) {
+    const elapsedMs = Date.now() - geminiStartedAt;
+    const isTimeout = error?.name === "AbortError";
+    console.error(
+      `Human detection Gemini ${isTimeout ? "TIMEOUT" : "NETWORK ERROR"} after ${elapsedMs}ms:`,
+      error?.name || "Error",
+      error?.message || ""
+    );
+    return sendJson(res, isTimeout ? 504 : 502, {
+      success: false,
+      error: isTimeout ? "AI_TIMEOUT" : "AI_NETWORK_ERROR",
+      message: isTimeout
+        ? "Gemini did not respond within the server timeout. Please retry."
+        : "Unable to reach Gemini AI. Please retry."
+    });
+  }
+
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    console.error("Human detection Gemini error:", response.status, data?.error?.status || "");
-    return sendJson(res, 502, { success: false, error: "AI detection service failed" });
+    console.error(
+      "Human detection Gemini HTTP error:",
+      response.status,
+      data?.error?.status || "",
+      data?.error?.message || ""
+    );
+    return sendJson(res, 502, {
+      success: false,
+      error: "AI_SERVICE_ERROR",
+      gemini_status: response.status
+    });
   }
   const outputText = (data.candidates || [])
     .flatMap(candidate => candidate.content?.parts || [])
