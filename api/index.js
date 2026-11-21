@@ -12,8 +12,6 @@ const PAYMENT_GRACE_SECONDS = 30;
 const QR_CLOSE_BY_SECONDS = 960;
 const RAZORPAY_TIMEOUT_MS = 7000;
 const HOSTINGER_TIMEOUT_MS = 5000;
-// Warm-instance protection against repeated Gemini quota/rate-limit requests.
-let geminiRateLimitUntilMs = 0;
 
 function sendJson(res, status, data) {
   res.status(status);
@@ -859,106 +857,47 @@ async function humanDetect(req, res) {
   }
   if (!image.length) return sendJson(res, 400, { success: false, error: "Empty image" });
 
-  // If Gemini recently returned 429, stop sending more requests for this warm instance.
-  const cooldownRemainingMs = geminiRateLimitUntilMs - Date.now();
-  if (cooldownRemainingMs > 0) {
-    const cooldownSec = Math.ceil(cooldownRemainingMs / 1000);
-    console.warn(`Human detection blocked by Gemini rate-limit cooldown (${cooldownSec}s remaining)`);
-    res.setHeader("Retry-After", String(cooldownSec));
-    return sendJson(res, 429, {
-      success: false,
-      result: "AI_RATE_LIMITED",
-      error: "GEMINI_RATE_LIMIT_COOLDOWN",
-      cooldown_seconds: cooldownSec,
-      message: "Gemini rate limit cooldown active. Wait before retrying."
-    });
-  }
+  const apiKey = requiredEnv("OPENAI_API_KEY");
+  const model = process.env.OPENAI_HUMAN_DETECT_MODEL || "gpt-4o-mini";
+  const prompt = `You are HelmiFresh Human Presence Detection AI. Analyze the camera image and determine whether a REAL HUMAN PERSON is physically visible anywhere in the image. Return HUMAN if any recognizable real person or body part is visible, including standing, sitting, bending, crouching, lying down, stationary, facing away, partially visible, wearing a helmet/mask/dark clothing, in foreground/background, entering/leaving, or small but recognizable. Do not require movement or face visibility. Check image edges and background. Return NO_HUMAN only when no real person is visible. Return UNCERTAIN only if too blurry, dark, corrupted, obstructed, or ambiguous. Do not confuse animals, mannequins, statues, posters, photographs, shadows, reflections, or human-shaped objects with real people. Return exactly one token: HUMAN, NO_HUMAN, or UNCERTAIN. No explanation.`;
 
-  const apiKey = requiredEnv("GEMINI_API_KEY");
-  const model = process.env.GEMINI_HUMAN_DETECT_MODEL || "gemini-3.5-flash-lite";
-  const prompt = `
-You are HelmiFresh Human Presence Detection AI.
-
-Analyze the camera image and determine whether a REAL HUMAN PERSON
-is physically visible anywhere in the image.
-
-Return HUMAN if a real person is visible in ANY of these situations:
-- A person is standing.
-- A person is sitting on a chair, bench, or other surface.
-- A person is bending, leaning, crouching, or lying down.
-- A person is stationary and not moving.
-- A person is facing the camera or facing away from the camera.
-- A person is partially visible.
-- A person's head, face, torso, arms, hands, or legs are visible.
-- A person is wearing a helmet, mask, or dark clothing.
-- A person is visible in the foreground or background.
-- A person is entering or leaving the camera frame.
-- A person is small but recognizable in the image.
-
-IMPORTANT DETECTION RULES:
-- Do NOT require the person to be standing.
-- Do NOT require the person to be moving.
-- Do NOT require the face to be visible.
-- Do NOT classify a seated or stationary person as NO_HUMAN.
-- Check the entire image, including edges and background.
-- If a recognizable real human body or body part is visible, prefer HUMAN.
-
-Return NO_HUMAN only when there is no real human person visible in the image.
-
-Return UNCERTAIN only when the image is too blurry, too dark, corrupted,
-obstructed, or visually ambiguous to make a reliable decision.
-
-Do not confuse animals, mannequins, statues, posters, photographs, shadows,
-reflections, or human-shaped objects with real people.
-
-Return exactly one token:
-HUMAN
-NO_HUMAN
-or
-UNCERTAIN
-
-Do not provide any explanation.
-`;
-  // Two controlled attempts: keep each Gemini call short so the ESP32/Vercel
-  // request does not wait for one long 18-second stall. Retry only transient
-  // timeout/network failures; do not retry HTTP/API errors.
-  const GEMINI_ATTEMPT_TIMEOUT_MS = 8000;
-  const GEMINI_MAX_ATTEMPTS = 3;
-  const GEMINI_RETRY_DELAYS_MS = [1000, 3000];
-  const geminiStartedAt = Date.now();
+  const OPENAI_TIMEOUT_MS = 8000;
+  const MAX_ATTEMPTS = 2;
+  const RETRY_DELAY_MS = 1200;
+  const startedAt = Date.now();
   let response = null;
   let lastError = null;
 
-  for (let attempt = 1; attempt <= GEMINI_MAX_ATTEMPTS; attempt++) {
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const attemptStartedAt = Date.now();
     try {
       response = await fetchTimeout(
-        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+        "https://api.openai.com/v1/chat/completions",
         {
           method: "POST",
-          headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json" },
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            "Content-Type": "application/json",
+          },
           body: JSON.stringify({
-            contents: [{ parts: [
-              { text: prompt },
-              { inlineData: { mimeType: "image/jpeg", data: image.toString("base64") } }
-            ] }],
-            generationConfig: { temperature: 0, maxOutputTokens: 10 }
-          })
+            model,
+            messages: [{
+              role: "user",
+              content: [
+                { type: "text", text: prompt },
+                { type: "image_url", image_url: { url: `data:image/jpeg;base64,${image.toString("base64")}`, detail: "low" } }
+              ]
+            }],
+            temperature: 0,
+            max_tokens: 10,
+          }),
         },
-        GEMINI_ATTEMPT_TIMEOUT_MS
+        OPENAI_TIMEOUT_MS
       );
-      console.log(`Human detection Gemini attempt ${attempt}/${GEMINI_MAX_ATTEMPTS} HTTP ${response.status} in ${Date.now() - attemptStartedAt}ms`);
+      console.log(`Human detection OpenAI attempt ${attempt}/${MAX_ATTEMPTS} HTTP ${response.status} in ${Date.now() - attemptStartedAt}ms`);
       lastError = null;
-      if (response.status === 429) {
-        // Quota/rate limit: do not retry immediately. Block subsequent requests for 60 sec.
-        geminiRateLimitUntilMs = Date.now() + 60000;
-        console.warn("Human detection Gemini HTTP 429: setting 60-second cooldown; no retry");
-        break;
-      }
-      if ([500, 502, 503, 504, 408].includes(response.status) && attempt < GEMINI_MAX_ATTEMPTS) {
-        const delayMs = GEMINI_RETRY_DELAYS_MS[attempt - 1] || 3000;
-        console.warn(`Human detection Gemini HTTP ${response.status} transient; retrying after ${delayMs}ms (attempt ${attempt + 1}/${GEMINI_MAX_ATTEMPTS})`);
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      if ([408, 500, 502, 503, 504].includes(response.status) && attempt < MAX_ATTEMPTS) {
+        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
         response = null;
         continue;
       }
@@ -966,59 +905,46 @@ Do not provide any explanation.
     } catch (error) {
       lastError = error;
       const isTimeout = error?.name === "AbortError";
-      console.error(`Human detection Gemini attempt ${attempt}/${GEMINI_MAX_ATTEMPTS} ${isTimeout ? "TIMEOUT" : "NETWORK ERROR"} after ${Date.now() - attemptStartedAt}ms:`, error?.name || "Error", error?.message || "");
-      if (attempt < GEMINI_MAX_ATTEMPTS) {
-        await new Promise((resolve) => setTimeout(resolve, GEMINI_RETRY_DELAY_MS));
-      }
+      console.error(`Human detection OpenAI attempt ${attempt}/${MAX_ATTEMPTS} ${isTimeout ? "TIMEOUT" : "NETWORK ERROR"}:`, error?.name || "Error", error?.message || "");
+      if (attempt < MAX_ATTEMPTS) await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
     }
   }
 
   if (!response) {
-    const elapsedMs = Date.now() - geminiStartedAt;
+    const elapsedMs = Date.now() - startedAt;
     const isTimeout = lastError?.name === "AbortError";
-    console.error(`Human detection Gemini final failure after ${elapsedMs}ms`);
     return sendJson(res, isTimeout ? 504 : 502, {
       success: false,
       error: isTimeout ? "AI_TIMEOUT" : "AI_NETWORK_ERROR",
-      attempts: GEMINI_MAX_ATTEMPTS,
+      attempts: MAX_ATTEMPTS,
       elapsed_ms: elapsedMs,
-      message: isTimeout
-        ? "Gemini timed out on both attempts. Please retry."
-        : "Unable to reach Gemini AI after retry. Please retry."
+      message: isTimeout ? "OpenAI timed out. Please retry later." : "Unable to reach OpenAI. Please retry later."
     });
   }
 
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    console.error(
-      "Human detection Gemini HTTP error:",
-      response.status,
-      data?.error?.status || "",
-      data?.error?.message || ""
-    );
+    console.error("Human detection OpenAI HTTP error:", response.status, data?.error?.type || "", data?.error?.message || "");
     if (response.status === 429) {
-      const cooldownSec = Math.max(1, Math.ceil((geminiRateLimitUntilMs - Date.now()) / 1000));
-      res.setHeader("Retry-After", String(cooldownSec));
+      res.setHeader("Retry-After", "60");
       return sendJson(res, 429, {
         success: false,
         result: "AI_RATE_LIMITED",
-        error: "GEMINI_RATE_LIMIT",
-        gemini_status: 429,
-        cooldown_seconds: cooldownSec,
-        message: "Gemini quota/rate limit reached. Wait before retrying."
+        error: "OPENAI_RATE_LIMIT",
+        openai_status: 429,
+        cooldown_seconds: 60,
+        message: "OpenAI rate limit/quota reached. Wait before retrying."
       });
     }
     return sendJson(res, 502, {
       success: false,
       result: "AI_SERVICE_ERROR",
       error: "AI_SERVICE_ERROR",
-      gemini_status: response.status
+      openai_status: response.status
     });
   }
-  const outputText = (data.candidates || [])
-    .flatMap(candidate => candidate.content?.parts || [])
-    .map(part => part.text || "")
-    .join(" ").trim().toUpperCase();
+
+  const outputText = String(data?.choices?.[0]?.message?.content || "").trim().toUpperCase();
   const result = outputText.includes("NO_HUMAN")
     ? "NO_HUMAN"
     : outputText.includes("HUMAN")
