@@ -859,11 +859,10 @@ async function humanDetect(req, res) {
 
   const apiKey = requiredEnv("OPENAI_API_KEY");
   const model = process.env.OPENAI_HUMAN_DETECT_MODEL || "gpt-4o-mini";
-  const prompt = `You are HelmiFresh Human Presence Detection AI. Analyze the camera image and determine whether a REAL HUMAN PERSON is physically visible anywhere in the image. Return HUMAN if any recognizable real person or body part is visible, including standing, sitting, bending, crouching, lying down, stationary, facing away, partially visible, wearing a helmet/mask/dark clothing, in foreground/background, entering/leaving, or small but recognizable. Do not require movement or face visibility. Check image edges and background. Return NO_HUMAN only when no real person is visible. Return UNCERTAIN only if too blurry, dark, corrupted, obstructed, or ambiguous. Do not confuse animals, mannequins, statues, posters, photographs, shadows, reflections, or human-shaped objects with real people. Return exactly one token: HUMAN, NO_HUMAN, or UNCERTAIN. No explanation.`;
+  const prompt = `Classify this camera image for real human presence. HUMAN: any recognizable real person or body part, including partial, background, edge, seated, standing, bending, wearing helmet/mask, or facing away. NO_HUMAN: no real person visible. UNCERTAIN: image is too blurry, dark, obstructed, or ambiguous. Do not count animals, mannequins, statues, photos, posters, shadows, reflections, or human-shaped objects. Reply with exactly one token: HUMAN, NO_HUMAN, or UNCERTAIN.`;
 
-  const OPENAI_TIMEOUT_MS = 8000;
-  const MAX_ATTEMPTS = 2;
-  const RETRY_DELAY_MS = 1200;
+  const OPENAI_TIMEOUT_MS = 10000;
+  const MAX_ATTEMPTS = 1; // single server-side attempt; ESP32 owns retry
   const startedAt = Date.now();
   let response = null;
   let lastError = null;
@@ -889,7 +888,7 @@ async function humanDetect(req, res) {
               ]
             }],
             temperature: 0,
-            max_tokens: 10,
+            max_tokens: 3,
           }),
         },
         OPENAI_TIMEOUT_MS
@@ -950,7 +949,9 @@ async function humanDetect(req, res) {
     : outputText.includes("HUMAN")
       ? "HUMAN"
       : "UNCERTAIN";
-  return sendJson(res, 200, { success: true, result, model });
+  const elapsedMs = Date.now() - startedAt;
+  res.setHeader("X-Helmi-AI-Time-Ms", String(elapsedMs));
+  return sendJson(res, 200, { success: true, result, model, elapsed_ms: elapsedMs });
 }
 
 export default async function handler(req, res) {
