@@ -20,7 +20,7 @@ function sendJson(res, status, data) {
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader(
     "Access-Control-Allow-Headers",
-    "Content-Type, X-Helmi-Action, X-Helmi-Human-Token"
+    "Content-Type, X-Helmi-Action"
   );
   res.setHeader("Cache-Control", "no-store, max-age=0");
   return res.end(JSON.stringify(data));
@@ -823,137 +823,6 @@ async function webhook(req, res) {
 }
 
 
-async function readImageBody(req, maxBytes = 4 * 1024 * 1024) {
-  const chunks = [];
-  let total = 0;
-  for await (const chunk of req) {
-    total += chunk.length;
-    if (total > maxBytes) throw new Error("Image too large");
-    chunks.push(chunk);
-  }
-  return Buffer.concat(chunks);
-}
-
-function tokenMatches(provided, expected) {
-  if (typeof provided !== "string" || typeof expected !== "string") return false;
-  const a = Buffer.from(provided);
-  const b = Buffer.from(expected);
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
-}
-
-async function humanDetect(req, res) {
-  const expectedToken = requiredEnv("HELMI_HUMAN_DETECT_TOKEN");
-  const providedToken = req.headers["x-helmi-human-token"];
-  if (!tokenMatches(providedToken, expectedToken)) {
-    return sendJson(res, 401, { success: false, result: "UNAUTHORIZED" });
-  }
-  const contentType = String(req.headers["content-type"] || "").toLowerCase();
-  if (!contentType.startsWith("image/jpeg")) {
-    return sendJson(res, 415, { success: false, error: "Send JPEG image bytes with Content-Type: image/jpeg" });
-  }
-  let image;
-  try { image = await readImageBody(req); } catch (error) {
-    return sendJson(res, 413, { success: false, error: "Image must be 4 MB or smaller" });
-  }
-  if (!image.length) return sendJson(res, 400, { success: false, error: "Empty image" });
-
-  const apiKey = requiredEnv("OPENAI_API_KEY");
-  const model = process.env.OPENAI_HUMAN_DETECT_MODEL || "gpt-4o-mini";
-  const prompt = `Classify this camera image for real human presence. HUMAN: any recognizable real person or body part, including partial, background, edge, seated, standing, bending, wearing helmet/mask, or facing away. NO_HUMAN: no real person visible. UNCERTAIN: image is too blurry, dark, obstructed, or ambiguous. Do not count animals, mannequins, statues, photos, posters, shadows, reflections, or human-shaped objects. Reply with exactly one token: HUMAN, NO_HUMAN, or UNCERTAIN.`;
-
-  const OPENAI_TIMEOUT_MS = 10000;
-  const MAX_ATTEMPTS = 1; // single server-side attempt; ESP32 owns retry
-  const startedAt = Date.now();
-  let response = null;
-  let lastError = null;
-
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const attemptStartedAt = Date.now();
-    try {
-      response = await fetchTimeout(
-        "https://api.openai.com/v1/chat/completions",
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            model,
-            messages: [{
-              role: "user",
-              content: [
-                { type: "text", text: prompt },
-                { type: "image_url", image_url: { url: `data:image/jpeg;base64,${image.toString("base64")}`, detail: "low" } }
-              ]
-            }],
-            temperature: 0,
-            max_tokens: 3,
-          }),
-        },
-        OPENAI_TIMEOUT_MS
-      );
-      console.log(`Human detection OpenAI attempt ${attempt}/${MAX_ATTEMPTS} HTTP ${response.status} in ${Date.now() - attemptStartedAt}ms`);
-      lastError = null;
-      if ([408, 500, 502, 503, 504].includes(response.status) && attempt < MAX_ATTEMPTS) {
-        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
-        response = null;
-        continue;
-      }
-      break;
-    } catch (error) {
-      lastError = error;
-      const isTimeout = error?.name === "AbortError";
-      console.error(`Human detection OpenAI attempt ${attempt}/${MAX_ATTEMPTS} ${isTimeout ? "TIMEOUT" : "NETWORK ERROR"}:`, error?.name || "Error", error?.message || "");
-      if (attempt < MAX_ATTEMPTS) await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
-    }
-  }
-
-  if (!response) {
-    const elapsedMs = Date.now() - startedAt;
-    const isTimeout = lastError?.name === "AbortError";
-    return sendJson(res, isTimeout ? 504 : 502, {
-      success: false,
-      error: isTimeout ? "AI_TIMEOUT" : "AI_NETWORK_ERROR",
-      attempts: MAX_ATTEMPTS,
-      elapsed_ms: elapsedMs,
-      message: isTimeout ? "OpenAI timed out. Please retry later." : "Unable to reach OpenAI. Please retry later."
-    });
-  }
-
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    console.error("Human detection OpenAI HTTP error:", response.status, data?.error?.type || "", data?.error?.message || "");
-    if (response.status === 429) {
-      res.setHeader("Retry-After", "60");
-      return sendJson(res, 429, {
-        success: false,
-        result: "AI_RATE_LIMITED",
-        error: "OPENAI_RATE_LIMIT",
-        openai_status: 429,
-        cooldown_seconds: 60,
-        message: "OpenAI rate limit/quota reached. Wait before retrying."
-      });
-    }
-    return sendJson(res, 502, {
-      success: false,
-      result: "AI_SERVICE_ERROR",
-      error: "AI_SERVICE_ERROR",
-      openai_status: response.status
-    });
-  }
-
-  const outputText = String(data?.choices?.[0]?.message?.content || "").trim().toUpperCase();
-  const result = outputText.includes("NO_HUMAN")
-    ? "NO_HUMAN"
-    : outputText.includes("HUMAN")
-      ? "HUMAN"
-      : "UNCERTAIN";
-  const elapsedMs = Date.now() - startedAt;
-  res.setHeader("X-Helmi-AI-Time-Ms", String(elapsedMs));
-  return sendJson(res, 200, { success: true, result, model, elapsed_ms: elapsedMs });
-}
-
 export default async function handler(req, res) {
   try {
     if (req.method === "OPTIONS") {
@@ -965,7 +834,7 @@ export default async function handler(req, res) {
       );
       res.setHeader(
         "Access-Control-Allow-Headers",
-        "Content-Type, X-Helmi-Action, X-Helmi-Human-Token"
+        "Content-Type, X-Helmi-Action"
       );
       return res.end();
     }
@@ -1036,10 +905,6 @@ export default async function handler(req, res) {
         closed_at: result.data.closed_at,
         close_reason: result.data.close_reason,
       });
-    }
-
-    if (req.method === "POST" && req.headers["x-helmi-action"] === "human-detect") {
-      return await humanDetect(req, res);
     }
 
     if (req.method === "POST") {
